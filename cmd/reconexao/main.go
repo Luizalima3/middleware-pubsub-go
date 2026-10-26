@@ -16,7 +16,7 @@ func main() {
 	ctx, cancelar := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancelar()
 
-	c, err := client.Conectar(ctx, "ws://localhost:8080/ws")
+	c, err := client.Conectar(ctx, []string{"ws://localhost:8080/ws"})
 	if err != nil {
 		log.Fatal(err)
 	}
