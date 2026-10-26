@@ -22,6 +22,7 @@ func tratarConexao(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.CloseNow()
+	conn.SetReadLimit(64 * 1024)
 	log.Println("cliente conectado")
 
 	for {
@@ -30,7 +31,7 @@ func tratarConexao(w http.ResponseWriter, r *http.Request) {
 			log.Println("cliente saiu:", err)
 			return
 		}
-		log.Printf("recebi: %s", dados)
+		log.Printf("recebi %d bytes", len(dados))
 
 		ctx, cancelar := context.WithTimeout(r.Context(), 5*time.Second)
 		err = conn.Write(ctx, tipo, dados)
