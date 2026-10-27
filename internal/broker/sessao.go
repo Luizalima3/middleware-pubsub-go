@@ -136,6 +136,14 @@ func (s *Sessao) publicar(m protocol.Mensagem) {
 	c := &s.b.cont
 	c.publicacoesRecebidas.Add(1)
 
+	// Ponto de integração do token bucket (Parte 3): a resposta de recusa
+	// (TipoErro com RATE_LIMIT) vem pronta de controle.Verificar.
+	if aviso := s.bucket.Verificar(m); aviso != nil {
+		c.publicacoesRejeitadasRateLimit.Add(1)
+		s.enfileirarControle(*aviso)
+		return
+	}
+
 	t := s.b.topico(m.Topico)
 	if t == nil {
 		c.publicacoesTopicoInexistente.Add(1)
