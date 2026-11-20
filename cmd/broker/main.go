@@ -1,112 +1,55 @@
-// broker é o executável do núcleo Publish/Subscribe (Cenário C).
+// broker executa o servidor UDP. O par é opcional; o projeto usa até dois brokers.
 package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
-	"log"
-	"net"
-	"net/http"
+	"github.com/Luizalima3/middleware-pubsub-go/internal/broker"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
-
-	"github.com/Luizalima3/middleware-pubsub-go/internal/broker"
 )
 
 func main() {
-	if err := executar(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	if e := run(); e != nil {
+		fmt.Fprintln(os.Stderr, e)
 		os.Exit(1)
 	}
 }
-
-func executar() error {
-	var (
-		addr           string
-		filaAssinante  int
-		filaControle   int
-		filaTopico     int
-		taxa           float64
-		rajada         int
-		timeoutEscrita time.Duration
-		origens        string
-	)
-
-	flag.StringVar(&addr, "addr", ":8080", "endereço HTTP de escuta (rotas /ws e /contadores)")
-	flag.IntVar(&filaAssinante, "fila-assinante", broker.FilaAssinantePadrao, "capacidade da fila de dados por inscrito (drop-oldest)")
-	flag.IntVar(&filaControle, "fila-controle", broker.FilaControlePadrao, "capacidade da fila de controle por sessão")
-	flag.IntVar(&filaTopico, "fila-topico", broker.FilaTopicoPadrao, "capacidade da fila de cada tópico")
-	flag.Float64Var(&taxa, "taxa", broker.TaxaPadrao, "publicações/s permitidas por sessão (token bucket)")
-	flag.IntVar(&rajada, "rajada", broker.RajadaPadrao, "rajada máxima de publicações por sessão (token bucket)")
-	flag.DurationVar(&timeoutEscrita, "timeout-escrita", broker.TimeoutEscritaPadrao, "tempo limite de cada escrita no socket")
-	flag.StringVar(&origens, "origens", "*", "padrões de Origin aceitos no WebSocket, separados por vírgula")
+func run() error {
+	var c broker.Config
+	flag.StringVar(&c.Endereco, "endereco", "127.0.0.1:8080", "endereço UDP local")
+	flag.StringVar(&c.Par, "par", "", "endereço UDP do outro broker")
+	flag.StringVar(&c.ID, "id", "", "identificador do broker (opcional)")
+	flag.Float64Var(&c.TaxaCliente, "teto-cliente", 100, "publicações/s por identificador e teto de entrega por consumidor")
+	flag.Float64Var(&c.TaxaEntrada, "teto-entrada", 2000, "publicações/s aceitas no total, incluindo repasses")
+	flag.Float64Var(&c.TaxaSaida, "teto-saida", 5000, "datagramas/s totais de saída, incluindo controle")
+	flag.Float64Var(&c.TaxaControle, "teto-controle", 200, "datagramas/s de controle por sentido")
+	flag.Float64Var(&c.TaxaPar, "teto-par", 1000, "repasses/s entre brokers por sentido")
+	flag.IntVar(&c.Rajada, "rajada", 4, "fichas iniciais e limite de rajada por orçamento")
+	flag.IntVar(&c.FilaTopico, "fila-topico", 128, "mensagens por tópico")
+	flag.IntVar(&c.FilaCliente, "fila-cliente", 64, "mensagens por consumidor")
+	flag.IntVar(&c.BytesTopico, "bytes-topico", 128000, "bytes máximos na fila de cada tópico")
+	flag.IntVar(&c.BytesCliente, "bytes-cliente", 64000, "bytes máximos na fila de cada consumidor")
+	flag.IntVar(&c.MaxClientes, "max-clientes", 256, "sessões UDP simultâneas")
+	flag.IntVar(&c.MaxTopicos, "max-topicos", 128, "tópicos em memória")
+	flag.DurationVar(&c.Intervalo, "intervalo", time.Second, "período de anúncios e manutenção")
+	flag.DurationVar(&c.Inatividade, "inatividade", 5*time.Second, "expiração de clientes e interesses remotos")
 	flag.Parse()
-
-	if filaAssinante < 1 || filaControle < 1 || filaTopico < 1 {
-		return errors.New("as capacidades das filas devem ser >= 1")
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	b, e := broker.Iniciar(c)
+	if e != nil {
+		return e
 	}
-	if taxa <= 0 || rajada < 1 {
-		return errors.New("taxa deve ser > 0 e rajada >= 1")
+	defer b.Fechar()
+	fmt.Println(b.String())
+	if c.Par != "" {
+		fmt.Println("Par:", c.Par)
 	}
-	if timeoutEscrita <= 0 {
-		return errors.New("timeout-escrita deve ser > 0")
-	}
-
-	var padroesOrigem []string
-	for _, s := range strings.Split(origens, ",") {
-		if s = strings.TrimSpace(s); s != "" {
-			padroesOrigem = append(padroesOrigem, s)
-		}
-	}
-
-	b := broker.Novo(broker.Config{
-		FilaAssinante:  filaAssinante,
-		FilaControle:   filaControle,
-		FilaTopico:     filaTopico,
-		Taxa:           taxa,
-		Rajada:         rajada,
-		TimeoutEscrita: timeoutEscrita,
-		Origens:        padroesOrigem,
-	})
-
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("escutar em %s: %w", addr, err)
-	}
-
-	srv := &http.Server{
-		Handler:           b.Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-
-	ctx, parar := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer parar()
-
-	erroSrv := make(chan error, 1)
-	go func() {
-		log.Printf("broker ouvindo em %s (ws://localhost%s/ws | http://localhost%s/contadores)", ln.Addr(), addr, addr)
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			erroSrv <- err
-			return
-		}
-		erroSrv <- nil
-	}()
-
-	select {
-	case err := <-erroSrv:
-		_ = b.Fechar()
-		return err
-	case <-ctx.Done():
-		log.Println("sinal recebido: encerrando broker graciosamente...")
-		_ = b.Fechar()
-		ctxShutdown, cancelar := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancelar()
-		_ = srv.Shutdown(ctxShutdown)
-		return <-erroSrv
-	}
+	<-ctx.Done()
+	fmt.Printf("Contadores finais: %+v\n", b.Estatisticas())
+	return nil
 }

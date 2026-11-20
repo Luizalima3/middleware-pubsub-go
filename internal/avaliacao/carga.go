@@ -3,17 +3,20 @@
 package avaliacao
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/Luizalima3/middleware-pubsub-go/internal/client"
-	"github.com/Luizalima3/middleware-pubsub-go/internal/protocol"
+	"github.com/Luizalima3/middleware-pubsub-go/client"
+	"github.com/Luizalima3/middleware-pubsub-go/protocol"
 )
 
 type Config struct {
@@ -29,6 +32,9 @@ type Config struct {
 	Fila            int           `json:"fila_gerador"`
 	Lentos          int           `json:"assinantes_lentos"`
 	AtrasoLento     time.Duration `json:"atraso_consumo_ns"`
+	IgnorarControle bool          `json:"ignorar_controle"`
+	Distribuir      bool          `json:"distribuir_brokers"`
+	BufferCliente   int           `json:"buffer_cliente"`
 	TopicoExistente bool          `json:"usar_topico_existente"`
 }
 
@@ -42,8 +48,8 @@ func (c Config) validar() (int, error) {
 	if c.Taxa <= 0 || math.IsNaN(c.Taxa) || math.IsInf(c.Taxa, 0) || c.Duracao <= 0 || c.Duracao > 10*time.Minute || c.Drenagem < 0 || c.Drenagem > time.Minute || c.Timeout <= 0 || c.Fila < 1 || c.AtrasoLento < 0 {
 		return 0, errors.New("taxa, duração, timeout e fila devem ser positivos; atrasos não negativos")
 	}
-	if c.Payload < 32 || c.Payload > protocol.MaxMensagem-len(c.Topico)-protocol.TamanhoCabecalho {
-		return 0, errors.New("payload deve ter pelo menos 32 bytes e caber no frame de 64 KiB")
+	if c.Payload < 96 || c.Payload > 512 {
+		return 0, errors.New("payload deve ter entre 96 e 512 bytes para caber no JSON de 1000 bytes")
 	}
 	n := math.Ceil(c.Taxa * c.Duracao.Seconds())
 	if n < 1 || n > 1e6 || float64(c.Publicadores)*n > 1e6 || float64(c.Publicadores)*n*float64(c.Assinantes) > 1e8 || c.Publicadores+c.Assinantes > 10000 || c.Fila > 10000 {
@@ -53,7 +59,9 @@ func (c Config) validar() (int, error) {
 }
 
 type Linha struct {
-	Segundo                                                                        int `json:"segundo"`
+	TaxaMedia                                                                      float64 `json:"taxa_media_cliente"`
+	AmostrasTaxa                                                                   uint64  `json:"amostras_taxa"`
+	Segundo                                                                        int     `json:"segundo"`
 	Oferecidas, Enviadas, ErrosEnvio, Puladas, Recebidas, Rejeitadas, SemInscritos uint64
 	P99MS                                                                          float64 `json:"p99_ms"`
 	h                                                                              histograma
@@ -75,6 +83,9 @@ type Resumo struct {
 	Rejeitadas         uint64    `json:"avisos_rate_limit"`
 	SemInscritos       uint64    `json:"avisos_sem_inscritos"`
 	OutrosErros        uint64    `json:"avisos_outros_erros"`
+	DescartesBroker    uint64    `json:"avisos_descartes_broker"`
+	DescartesCliente   uint64    `json:"descartes_fila_cliente"`
+	TaxaFinalMedia     float64   `json:"taxa_final_media"`
 	Invalidas          uint64    `json:"mensagens_de_teste_invalidas"`
 	P50MS              float64   `json:"p50_ms"`
 	P95MS              float64   `json:"p95_ms"`
@@ -128,30 +139,7 @@ func esperar(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// aguardarOK impede medir publicações antes de o broker confirmar a inscrição.
-func aguardarOK(ctx context.Context, c *client.Client, id uint32) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case msg, ok := <-c.Eventos():
-			if !ok {
-				return errors.New("cliente encerrado durante preparação")
-			}
-			if msg.ID != id {
-				continue
-			}
-			if msg.Tipo == protocol.TipoOK {
-				return nil
-			}
-			if msg.Tipo == protocol.TipoErro {
-				return fmt.Errorf("broker recusou operação: %s", msg.Conteudo)
-			}
-		}
-	}
-}
-
-// Executar exige broker Pub/Sub real. O fakebroker de eco não satisfaz os ACKs.
+// Executar prepara clientes UDP e mede do horário programado ao consumo.
 func Executar(ctx context.Context, cfg Config) (Resultado, error) {
 	n, err := cfg.validar()
 	if err != nil {
@@ -170,10 +158,17 @@ func Executar(ctx context.Context, cfg Config) (Resultado, error) {
 		}
 		wg.Wait()
 	}()
+	indiceConexao := 0
 	abrir := func() (*client.Client, error) {
 		cctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 		defer cancel()
-		c, e := client.Conectar(cctx, cfg.URLs)
+		urls := append([]string(nil), cfg.URLs...)
+		if cfg.Distribuir && len(urls) > 1 {
+			j := indiceConexao % len(urls)
+			urls = append(urls[j:], urls[:j]...)
+		}
+		indiceConexao++
+		c, e := client.ConectarComConfig(cctx, client.Config{Brokers: urls, TaxaMaxima: cfg.Taxa, Buffer: cfg.BufferCliente, IgnorarControle: cfg.IgnorarControle})
 		if e == nil {
 			clientes = append(clientes, c)
 		}
@@ -185,10 +180,8 @@ func Executar(ctx context.Context, cfg Config) (Resultado, error) {
 	}
 	if !cfg.TopicoExistente {
 		prep, cancel := context.WithTimeout(ctx, cfg.Timeout)
-		id, e := admin.CriarTopico(prep, cfg.Topico)
-		if e == nil {
-			e = aguardarOK(prep, admin, id)
-		}
+		_, e := admin.CriarTopico(prep, cfg.Topico)
+
 		cancel()
 		if e != nil {
 			return Resultado{}, fmt.Errorf("criação do tópico (exige TipoOK): %w", e)
@@ -201,10 +194,8 @@ func Executar(ctx context.Context, cfg Config) (Resultado, error) {
 			return Resultado{}, fmt.Errorf("assinante %d: %w", i, err)
 		}
 		prep, cancel := context.WithTimeout(ctx, cfg.Timeout)
-		id, err := subs[i].Assinar(prep, cfg.Topico)
-		if err == nil {
-			err = aguardarOK(prep, subs[i], id)
-		}
+		_, err := subs[i].Assinar(prep, cfg.Topico)
+
 		cancel()
 		if err != nil {
 			return Resultado{}, fmt.Errorf("inscrição %d (exige TipoOK): %w", i, err)
@@ -248,6 +239,13 @@ func Executar(ctx context.Context, cfg Config) (Resultado, error) {
 	esperar(ctx, time.Until(inicio.Add(cfg.Duracao+cfg.Drenagem)))
 	stopReaders()
 	readers.Wait()
+	for _, c := range subs {
+		m.r.DescartesCliente += c.Descartadas()
+	}
+	for _, c := range pubs {
+		m.r.TaxaFinalMedia += c.Taxa()
+	}
+	m.r.TaxaFinalMedia /= float64(len(pubs))
 	m.r.JanelaSegundos = math.Max(0, time.Since(inicio).Seconds())
 	m.r.Interrompido = ctx.Err() != nil
 	m.r.NaoAgendadas = m.r.Planejadas - m.r.Oferecidas
@@ -272,6 +270,9 @@ func Executar(ctx context.Context, cfg Config) (Resultado, error) {
 	}
 	for i := range m.linhas {
 		m.linhas[i].P99MS = m.linhas[i].h.percentil(.99)
+		if m.linhas[i].AmostrasTaxa > 0 {
+			m.linhas[i].TaxaMedia /= float64(m.linhas[i].AmostrasTaxa)
+		}
 	}
 	return Resultado{m.r, m.linhas}, nil
 }
@@ -291,12 +292,8 @@ func (m *coletor) publicador(ctx context.Context, c *client.Client, p int) {
 				continue
 			}
 			alvo := m.inicio.Add(time.Duration(float64(seq) / m.r.Config.Taxa * float64(time.Second)))
-			dados := make([]byte, m.r.Config.Payload)
-			copy(dados, "PSC1")
-			binary.BigEndian.PutUint64(dados[4:12], m.run)
-			binary.BigEndian.PutUint32(dados[12:16], uint32(p))
-			binary.BigEndian.PutUint64(dados[16:24], uint64(seq))
-			binary.BigEndian.PutUint64(dados[24:32], uint64(alvo.Sub(m.inicio)))
+			dados := bytes.Repeat([]byte("."), m.r.Config.Payload)
+			copy(dados, fmt.Sprintf("PSC1:%016x:%08x:%016x:%016x:", m.run, p, seq, uint64(alvo.Sub(m.inicio))))
 			m.Lock()
 			m.lag.registrar(time.Since(alvo))
 			m.Unlock()
@@ -324,6 +321,9 @@ func (m *coletor) publicador(ctx context.Context, c *client.Client, p int) {
 		}
 		m.Lock()
 		m.r.Oferecidas++
+		l := m.linha(alvo)
+		l.TaxaMedia += c.Taxa()
+		l.AmostrasTaxa++
 		m.linha(alvo).Oferecidas++
 		m.Unlock()
 		select {
@@ -347,6 +347,12 @@ func (m *coletor) ler(ctx context.Context, c *client.Client, sub int) {
 				return
 			}
 			if msg.Tipo != protocol.TipoMensagem {
+				if msg.Tipo == protocol.TipoDescartadas {
+					n, _ := strconv.ParseUint(string(msg.Conteudo), 10, 64)
+					m.Lock()
+					m.r.DescartesBroker += n
+					m.Unlock()
+				}
 				continue
 			}
 			if sub < m.r.Config.Lentos && !esperar(ctx, m.r.Config.AtrasoLento) {
@@ -359,11 +365,18 @@ func (m *coletor) ler(ctx context.Context, c *client.Client, sub int) {
 
 func (m *coletor) receber(msg protocol.Mensagem, sub int, agora time.Time) {
 	d := msg.Conteudo
-	if len(d) < 32 || string(d[:4]) != "PSC1" || binary.BigEndian.Uint64(d[4:12]) != m.run {
+	parts := strings.SplitN(string(d), ":", 6)
+	if len(parts) != 6 || parts[0] != "PSC1" {
 		return
 	}
-	p, seq := uint64(binary.BigEndian.Uint32(d[12:16])), binary.BigEndian.Uint64(d[16:24])
-	offset := binary.BigEndian.Uint64(d[24:32])
+	run, e0 := strconv.ParseUint(parts[1], 16, 64)
+	p, e1 := strconv.ParseUint(parts[2], 16, 32)
+	seq, e2 := strconv.ParseUint(parts[3], 16, 64)
+	offset, e3 := strconv.ParseUint(parts[4], 16, 64)
+	if e0 != nil || e1 != nil || e2 != nil || e3 != nil || run != m.run {
+		return
+	}
+
 	m.Lock()
 	defer m.Unlock()
 	if p >= uint64(m.r.Config.Publicadores) || seq >= uint64(m.n) || offset > uint64(m.r.Config.Duracao) || msg.Topico != m.r.Config.Topico {
@@ -406,6 +419,9 @@ func (m *coletor) avisos(ctx context.Context, c *client.Client) {
 			m.Lock()
 			l := m.linha(time.Now())
 			switch msg.Tipo {
+			case protocol.TipoDescartadas:
+				n, _ := strconv.ParseUint(string(msg.Conteudo), 10, 64)
+				m.r.DescartesBroker += n
 			case protocol.TipoSemInscritos:
 				m.r.SemInscritos++
 				l.SemInscritos++

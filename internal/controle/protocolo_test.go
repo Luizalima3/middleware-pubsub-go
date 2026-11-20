@@ -1,7 +1,7 @@
 package controle
 
 import (
-	"github.com/Luizalima3/middleware-pubsub-go/internal/protocol"
+	"github.com/Luizalima3/middleware-pubsub-go/protocol"
 	"testing"
 )
 
