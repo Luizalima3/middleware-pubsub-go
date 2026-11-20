@@ -6,13 +6,23 @@ Esta cópia contém a biblioteca cliente e o protocolo do repositório original,
 
 ## Componentes
 
+- `internal/broker`: núcleo do broker Pub/Sub (tópicos, inscrições, encaminhamento e filas drop-oldest).
 - `internal/protocol`: protocolo binário sobre WebSocket.
 - `internal/client`: biblioteca cliente Go com reconexão e inscrições.
 - `internal/controle`: token bucket por sessão e resposta de rejeição.
 - `internal/avaliacao`: gerador de carga, coleta de métricas e relatórios.
+- `cmd/broker`: executável do broker Pub/Sub.
 - `cmd/demo`: aplicação de demonstração no terminal.
 - `cmd/carga`: ferramenta de avaliação.
 - `cmd/fakebroker`: servidor de eco para testes manuais básicos da conexão. Não é o broker Pub/Sub.
+
+## Como executar o broker
+
+```sh
+go run ./cmd/broker
+```
+
+Por padrão, o broker escuta em `:8080` com o endpoint WebSocket em `ws://localhost:8080/ws` e os contadores do núcleo em `http://localhost:8080/contadores`. Use `go run ./cmd/broker -h` para listar as flags ou consulte [BROKER.md](BROKER.md) para detalhes da arquitetura e decisões de projeto.
 
 ## Verificação
 
