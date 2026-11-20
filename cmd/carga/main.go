@@ -22,7 +22,7 @@ func main() {
 func run() error {
 	var c avaliacao.Config
 	var brokers, dir string
-	flag.StringVar(&brokers, "brokers", "ws://localhost:8080/ws", "URLs separadas por vírgula")
+	flag.StringVar(&brokers, "brokers", "127.0.0.1:8080", "endereços UDP separados por vírgula")
 	flag.StringVar(&c.Topico, "topico", "teste/carga", "tópico exclusivo do experimento")
 	flag.BoolVar(&c.TopicoExistente, "topico-existente", false, "usar tópico já criado, sem solicitar criação")
 	flag.IntVar(&c.Publicadores, "publicadores", 1, "número de publicadores")
@@ -31,11 +31,14 @@ func run() error {
 	flag.DurationVar(&c.Duracao, "duracao", 10*time.Second, "janela de publicação")
 	flag.DurationVar(&c.Drenagem, "drenagem", 2*time.Second, "espera pelas entregas ao final")
 	flag.DurationVar(&c.Timeout, "timeout", 5*time.Second, "limite para conexão, ACK ou escrita")
-	flag.IntVar(&c.Payload, "payload", 128, "bytes do payload, mínimo 32")
+	flag.IntVar(&c.Payload, "payload", 128, "bytes do payload, mínimo 96")
 	flag.IntVar(&c.Fila, "fila", 64, "capacidade da fila de envio do gerador por publicador")
 	flag.IntVar(&c.Lentos, "lentos", 0, "quantos assinantes consomem com atraso")
 	flag.DurationVar(&c.AtrasoLento, "atraso-lento", 100*time.Millisecond, "atraso por mensagem nos assinantes lentos")
 	flag.StringVar(&dir, "saida", "resultados/carga", "pasta de saída; use uma pasta por execução")
+	flag.BoolVar(&c.IgnorarControle, "ignorar-controle", false, "teste de cliente que ignora o controle de envio")
+	flag.BoolVar(&c.Distribuir, "distribuir", false, "alternar a ordem dos brokers entre os clientes")
+	flag.IntVar(&c.BufferCliente, "buffer-cliente", 32, "mensagens na fila de leitura de cada cliente")
 	flag.Parse()
 	for _, s := range strings.Split(brokers, ",") {
 		if s = strings.TrimSpace(s); s != "" {

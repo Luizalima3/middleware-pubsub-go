@@ -6,14 +6,14 @@ import (
 	"log"
 	"time"
 
-	"github.com/Luizalima3/middleware-pubsub-go/internal/client"
+	"github.com/Luizalima3/middleware-pubsub-go/client"
 )
 
 func main() {
 	ctx, cancelar := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelar()
 
-	c, err := client.Conectar(ctx, []string{"ws://localhost:8080/ws"})
+	c, err := client.Conectar(ctx, []string{"127.0.0.1:8080"})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -32,14 +32,14 @@ func main() {
 	}
 	log.Printf("enviei Publicar com id %d", id)
 
-	// O broker falso ecoa tudo, então esperamos receber os dois frames de volta.
+	// O broker confirma a inscrição e distribui a publicação ao próprio inscrito.
 	for i := 0; i < 2; i++ {
 		select {
 		case m, ok := <-c.Eventos():
 			if !ok {
 				log.Fatal("conexão encerrada")
 			}
-			log.Printf("recebi: tipo=%d id=%d topico=%s conteudo=%s",
+			log.Printf("recebi: tipo=%s id=%d topico=%s conteudo=%s",
 				m.Tipo, m.ID, m.Topico, m.Conteudo)
 		case <-ctx.Done():
 			log.Fatal("tempo esgotado esperando o broker")

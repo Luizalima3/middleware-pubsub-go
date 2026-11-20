@@ -1,0 +1,85 @@
+// Package fila implementa filas limitadas por itens e bytes.
+package fila
+
+import "sync"
+
+type item[T any] struct {
+	valor T
+	bytes int
+}
+type Fila[T any] struct {
+	mu                        sync.Mutex
+	itens                     []item[T]
+	bytes, maxItens, maxBytes int
+	Sinal                     chan struct{}
+}
+
+func Nova[T any](itens, bytes int) *Fila[T] {
+	if itens < 1 || bytes < 1 {
+		panic("limites inválidos")
+	}
+	return &Fila[T]{maxItens: itens, maxBytes: bytes, Sinal: make(chan struct{}, 1)}
+}
+
+// Adicionar recusa a entrada ou retira os itens mais antigos, conforme a política.
+func (f *Fila[T]) Adicionar(v T, n int, descartarAntigos bool) ([]T, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var removidos []T
+	if n < 0 || n > f.maxBytes {
+		return nil, false
+	}
+	for len(f.itens) >= f.maxItens || f.bytes+n > f.maxBytes {
+		if !descartarAntigos {
+			return nil, false
+		}
+		r := f.itens[0]
+		f.itens[0] = item[T]{}
+		f.itens = f.itens[1:]
+		f.bytes -= r.bytes
+		removidos = append(removidos, r.valor)
+	}
+	f.itens = append(f.itens, item[T]{v, n})
+	f.bytes += n
+	select {
+	case f.Sinal <- struct{}{}:
+	default:
+	}
+	return removidos, true
+}
+func (f *Fila[T]) Retirar() (T, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var zero T
+	if len(f.itens) == 0 {
+		return zero, false
+	}
+	r := f.itens[0]
+	f.itens[0] = item[T]{}
+	f.itens = f.itens[1:]
+	f.bytes -= r.bytes
+	return r.valor, true
+}
+func (f *Fila[T]) Tamanho() (int, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.itens), f.bytes
+}
+func (f *Fila[T]) Limpar() { f.mu.Lock(); defer f.mu.Unlock(); f.itens = nil; f.bytes = 0 }
+func (f *Fila[T]) Remover(se func(T) bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	novos := f.itens[:0]
+	total := 0
+	for _, it := range f.itens {
+		if !se(it.valor) {
+			novos = append(novos, it)
+			total += it.bytes
+		}
+	}
+	for i := len(novos); i < len(f.itens); i++ {
+		f.itens[i] = item[T]{}
+	}
+	f.itens = novos
+	f.bytes = total
+}

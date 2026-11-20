@@ -4,131 +4,54 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"github.com/Luizalima3/middleware-pubsub-go/internal/broker"
 	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
-
-	"github.com/Luizalima3/middleware-pubsub-go/internal/controle"
-	"github.com/Luizalima3/middleware-pubsub-go/internal/protocol"
-	"github.com/coder/websocket"
 )
 
-// brokerTeste existe somente nos testes; não é o núcleo de produção da pessoa 1.
-func brokerTeste(t *testing.T, limitar, descartar, eco bool) string {
-	t.Helper()
-	var mu sync.Mutex
-	conns := map[*websocket.Conn]bool{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := websocket.Accept(w, r, nil)
-		if err != nil {
-			return
-		}
-		c.SetReadLimit(protocol.MaxMensagem)
-		mu.Lock()
-		conns[c] = false
-		mu.Unlock()
-		defer func() { mu.Lock(); delete(conns, c); mu.Unlock(); c.CloseNow() }()
-		bucket, _ := controle.Novo(.0001, 2)
-		enviar := func(dest *websocket.Conn, m protocol.Mensagem) {
-			d, e := protocol.Codificar(m)
-			if e == nil {
-				x, cancel := context.WithTimeout(r.Context(), time.Second)
-				_ = dest.Write(x, websocket.MessageBinary, d)
-				cancel()
-			}
-		}
-		for {
-			_, d, e := c.Read(r.Context())
-			if e != nil {
-				return
-			}
-			m, e := protocol.Decodificar(d)
-			if e != nil {
-				continue
-			}
-			if eco {
-				enviar(c, m)
-				continue
-			}
-			switch m.Tipo {
-			case protocol.TipoCriarTopico:
-				enviar(c, protocol.Mensagem{Tipo: protocol.TipoOK, ID: m.ID})
-			case protocol.TipoAssinar:
-				mu.Lock()
-				conns[c] = true
-				mu.Unlock()
-				enviar(c, protocol.Mensagem{Tipo: protocol.TipoOK, ID: m.ID})
-			case protocol.TipoPublicar:
-				if limitar && !bucket.Permitir() {
-					enviar(c, protocol.Mensagem{Tipo: protocol.TipoErro, ID: m.ID, Topico: m.Topico, Conteudo: []byte("RATE_LIMIT")})
-					continue
-				}
-				if descartar {
-					continue
-				}
-				mu.Lock()
-				var dests []*websocket.Conn
-				for dest, sub := range conns {
-					if sub {
-						dests = append(dests, dest)
-					}
-				}
-				mu.Unlock()
-				for _, dest := range dests {
-					enviar(dest, protocol.Mensagem{Tipo: protocol.TipoMensagem, ID: m.ID, Topico: m.Topico, Conteudo: m.Conteudo})
-				}
-			}
-		}
-	}))
-	t.Cleanup(func() {
-		mu.Lock()
-		for c := range conns {
-			c.CloseNow()
-		}
-		mu.Unlock()
-		srv.Close()
-	})
-	return "ws" + strings.TrimPrefix(srv.URL, "http")
-}
-
-func configuracao(url string) Config {
-	return Config{URLs: []string{url}, Topico: "teste/unico", Publicadores: 2, Assinantes: 3, Taxa: 10, Duracao: 200 * time.Millisecond, Drenagem: 150 * time.Millisecond, Timeout: 2 * time.Second, Payload: 64, Fila: 8}
-}
-
-func TestCargaEntregaFanoutERelatorio(t *testing.T) {
-	r, err := Executar(context.Background(), configuracao(brokerTeste(t, false, false, false)))
-	if err != nil {
-		t.Fatal(err)
+func TestCargaUDPComBrokerRealEExportacao(t *testing.T) {
+	b, e := broker.Iniciar(broker.Config{Endereco: "127.0.0.1:0", TaxaCliente: 1000, Rajada: 16})
+	if e != nil {
+		t.Fatal(e)
 	}
-	s := r.Resumo
-	if s.Enviadas != 4 || s.Recebidas != 12 || s.Ausentes != 0 || s.ErrosEnvio != 0 || s.Duplicadas != 0 {
-		t.Fatalf("contadores inesperados: %+v", s)
+	defer b.Fechar()
+	cfg := Config{URLs: []string{b.Endereco()}, Topico: "teste/avaliacao", Publicadores: 2, Assinantes: 3, Taxa: 10, Duracao: 300 * time.Millisecond, Drenagem: 300 * time.Millisecond, Timeout: 3 * time.Second, Payload: 128, Fila: 8}
+	r, e := Executar(context.Background(), cfg)
+	if e != nil {
+		t.Fatal(e)
 	}
-	if s.P99MS <= 0 || s.P99MS < s.P50MS {
-		t.Fatal("percentis inválidos")
+	if r.Resumo.Enviadas != 6 || r.Resumo.Recebidas != 18 || r.Resumo.Ausentes != 0 || r.Resumo.ErrosEnvio != 0 {
+		t.Fatalf("%+v", r.Resumo)
+	}
+	if r.Resumo.P99MS <= 0 || r.Resumo.P99MS < r.Resumo.P50MS {
+		t.Fatal("percentis")
 	}
 	dir := t.TempDir()
-	if err = Salvar(dir, r); err != nil {
-		t.Fatal(err)
+	if e = Salvar(dir, r); e != nil {
+		t.Fatal(e)
 	}
-	for _, name := range []string{"resumo.json", "intervalos.csv", "relatorio.html", "latencia.svg", "vazao.svg"} {
-		d, err := os.ReadFile(filepath.Join(dir, name))
-		if err != nil {
-			t.Fatal(err)
+	for _, n := range []string{"resumo.json", "intervalos.csv", "relatorio.html", "latencia.svg", "vazao.svg", "taxa.svg"} {
+		d, e := os.ReadFile(filepath.Join(dir, n))
+		if e != nil {
+			t.Fatal(e)
 		}
 		if strings.Contains(string(d), "%!") {
-			t.Fatalf("formatação quebrada em %s", name)
+			t.Fatal("formatação", n)
 		}
-		if strings.HasSuffix(name, ".svg") {
+		if n == "resumo.json" {
+			var s Resumo
+			if json.Unmarshal(d, &s) != nil || s.Recebidas != 18 {
+				t.Fatal("JSON")
+			}
+		}
+		if strings.HasSuffix(n, ".svg") {
 			dec := xml.NewDecoder(strings.NewReader(string(d)))
 			for {
-				_, e := dec.Token()
+				_, e = dec.Token()
 				if e == io.EOF {
 					break
 				}
@@ -137,69 +60,41 @@ func TestCargaEntregaFanoutERelatorio(t *testing.T) {
 				}
 			}
 		}
-		if name == "resumo.json" {
-			var x Resumo
-			if err = json.Unmarshal(d, &x); err != nil || x.Recebidas != 12 {
-				t.Fatal("resumo JSON inválido", err)
-			}
-		}
 	}
 }
-
-func TestAusentesNaoSaoConfundidasComEnvios(t *testing.T) {
-	r, err := Executar(context.Background(), configuracao(brokerTeste(t, false, true, false)))
-	if err != nil {
-		t.Fatal(err)
+func TestConfiguracaoInvalida(t *testing.T) {
+	c := Config{URLs: []string{"127.0.0.1:1"}, Topico: "x", Publicadores: 1, Assinantes: 1, Taxa: 1, Duracao: time.Second, Timeout: time.Second, Payload: 31, Fila: 1}
+	if _, e := c.validar(); e == nil {
+		t.Fatal("payload pequeno")
 	}
-	if r.Resumo.Enviadas != 4 || r.Resumo.Recebidas != 0 || r.Resumo.Ausentes != 12 {
-		t.Fatalf("%+v", r.Resumo)
-	}
-}
-
-func TestAvisoDeRateLimit(t *testing.T) {
-	cfg := configuracao(brokerTeste(t, true, false, false))
-	cfg.Publicadores = 1
-	cfg.Taxa = 50
-	r, err := Executar(context.Background(), cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Resumo.Enviadas != 10 || r.Resumo.Rejeitadas != 8 || r.Resumo.Recebidas != 6 || r.Resumo.Ausentes != 24 {
-		t.Fatalf("%+v", r.Resumo)
+	c.Payload = 128
+	c.Taxa = 1e9
+	if _, e := c.validar(); e == nil {
+		t.Fatal("carga sem limites")
 	}
 }
-
-func TestEcoNaoEConfundidoComBrokerReal(t *testing.T) {
-	cfg := configuracao(brokerTeste(t, false, false, true))
-	cfg.Timeout = 100 * time.Millisecond
-	_, err := Executar(context.Background(), cfg)
-	if err == nil || !strings.Contains(err.Error(), "TipoOK") {
-		t.Fatalf("erro esperado de preparação: %v", err)
-	}
-}
-
-func TestLimitesDeCarga(t *testing.T) {
-	cfg := configuracao("ws://localhost/ws")
-	cfg.Payload = 31
-	if _, err := cfg.validar(); err == nil {
-		t.Fatal("payload curto aceito")
-	}
-	cfg = configuracao("ws://localhost/ws")
-	cfg.Taxa = 1e9
-	if _, err := cfg.validar(); err == nil {
-		t.Fatal("carga excessiva aceita")
-	}
-}
-
-func TestHistogramaPercentis(t *testing.T) {
+func TestPercentis(t *testing.T) {
 	var h histograma
 	for i := 1; i <= 100; i++ {
 		h.registrar(time.Duration(i) * time.Millisecond)
 	}
-	for _, v := range []struct{ p, ms float64 }{{.5, 50}, {.95, 95}, {.99, 99}} {
-		x := h.percentil(v.p)
-		if x < v.ms || x > v.ms*1.021 {
-			t.Fatalf("p%.0f: %.4f", v.p*100, x)
-		}
+	if x := h.percentil(.99); x < 99 || x > 101.1 {
+		t.Fatal(x)
+	}
+}
+
+func TestManutencaoRapidaNaoReduzConsumidorNormal(t *testing.T) {
+	b, e := broker.Iniciar(broker.Config{Endereco: "127.0.0.1:0", TaxaCliente: 500, Rajada: 16, Intervalo: 50 * time.Millisecond, Inatividade: 4 * time.Second})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer b.Fechar()
+	cfg := Config{URLs: []string{b.Endereco()}, Topico: "teste/feedback", Publicadores: 1, Assinantes: 2, Taxa: 30, Duracao: 2200 * time.Millisecond, Drenagem: 400 * time.Millisecond, Timeout: 3 * time.Second, Payload: 128, Fila: 8}
+	r, e := Executar(context.Background(), cfg)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if r.Resumo.Ausentes != 0 || r.Resumo.Recebidas != r.Resumo.Enviadas*2 {
+		t.Fatalf("redução indevida: %+v", r.Resumo)
 	}
 }

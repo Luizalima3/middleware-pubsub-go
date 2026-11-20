@@ -9,14 +9,14 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/Luizalima3/middleware-pubsub-go/internal/client"
+	"github.com/Luizalima3/middleware-pubsub-go/client"
 )
 
 func main() {
 	ctx, cancelar := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancelar()
 
-	c, err := client.Conectar(ctx, []string{"ws://localhost:8080/ws"})
+	c, err := client.Conectar(ctx, []string{"127.0.0.1:8080"})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -29,7 +29,7 @@ func main() {
 
 	go func() {
 		for m := range c.Eventos() {
-			log.Printf("recebi: tipo=%d id=%d topico=%s conteudo=%s",
+			log.Printf("recebi: tipo=%s id=%d topico=%s conteudo=%s",
 				m.Tipo, m.ID, m.Topico, m.Conteudo)
 		}
 	}()

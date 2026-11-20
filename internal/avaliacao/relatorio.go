@@ -25,9 +25,9 @@ func Salvar(dir string, r Resultado) error {
 	}
 	var buf strings.Builder
 	w := csv.NewWriter(&buf)
-	w.Write([]string{"segundo", "oferecidas", "enviadas_socket", "puladas_gerador", "erros_envio", "entregas_unicas", "avisos_rate_limit", "avisos_sem_inscritos", "p99_ms"})
+	w.Write([]string{"segundo", "oferecidas", "enviadas_socket", "puladas_gerador", "erros_envio", "entregas_unicas", "avisos_rate_limit", "avisos_sem_inscritos", "p99_ms", "taxa_media_cliente", "amostras_taxa"})
 	for _, l := range r.Linhas {
-		w.Write([]string{strconv.Itoa(l.Segundo), u(l.Oferecidas), u(l.Enviadas), u(l.Puladas), u(l.ErrosEnvio), u(l.Recebidas), u(l.Rejeitadas), u(l.SemInscritos), fmt.Sprintf("%.6f", l.P99MS)})
+		w.Write([]string{strconv.Itoa(l.Segundo), u(l.Oferecidas), u(l.Enviadas), u(l.Puladas), u(l.ErrosEnvio), u(l.Recebidas), u(l.Rejeitadas), u(l.SemInscritos), fmt.Sprintf("%.6f", l.P99MS), fmt.Sprintf("%.6f", l.TaxaMedia), u(l.AmostrasTaxa)})
 	}
 	w.Flush()
 	if err = w.Error(); err != nil {
@@ -44,14 +44,18 @@ func Salvar(dir string, r Resultado) error {
 		}
 	}
 	s := r.Resumo
+	taxa := graficoTaxa(r.Linhas)
+	if err = os.WriteFile(filepath.Join(dir, "taxa.svg"), []byte(taxa), 0644); err != nil {
+		return err
+	}
 	page := fmt.Sprintf(`<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Avaliação Pub/Sub</title>
 <style>body{font:16px/1.6 system-ui,sans-serif;max-width:1050px;margin:40px auto;padding:0 24px;color:#213448;background:#f5f8fc}h1,h2{line-height:1.2}section{background:white;padding:24px;border:1px solid #dce4ee;border-radius:12px;margin:20px 0}.cards{display:flex;gap:24px;flex-wrap:wrap}.card strong{display:block;font-size:25px;color:#175e79}svg{max-width:100%%;height:auto}table{border-collapse:collapse;width:100%%}td,th{text-align:left;padding:8px;border-bottom:1px solid #ddd}code{overflow-wrap:anywhere}</style>
 <h1>Avaliação do middleware Pub/Sub</h1><p>Tópico <code>%s</code> · início %s</p>
 <section class="cards"><div class="card"><strong>%.2f ms</strong>p99 observado</div><div class="card"><strong>%d</strong>entregas únicas</div><div class="card"><strong>%d</strong>entregas ausentes</div><div class="card"><strong>%d</strong>publicações puladas</div></section>
 <section><h2>Configuração e contadores</h2><table><tr><th>Medida</th><th>Valor</th></tr>
-<tr><td>Publicadores / assinantes / assinantes lentos</td><td>%d / %d / %d</td></tr><tr><td>Taxa por publicador</td><td>%.2f msg/s</td></tr><tr><td>Duração / drenagem</td><td>%s / %s</td></tr><tr><td>Escritas sem erro / erros de envio</td><td>%d / %d</td></tr><tr><td>Avisos de limite / sem inscritos</td><td>%d / %d</td></tr><tr><td>Duplicadas / outros erros do broker</td><td>%d / %d</td></tr><tr><td>p50 / p95</td><td>%.3f / %.3f ms</td></tr><tr><td>p99 normais / lentos</td><td>%.3f / %.3f ms</td></tr><tr><td>p99 atraso do gerador</td><td>%.3f ms</td></tr><tr><td>Execução interrompida</td><td>%t</td></tr></table></section>
+<tr><td>Publicadores / assinantes / assinantes lentos</td><td>%d / %d / %d</td></tr><tr><td>Taxa por publicador</td><td>%.2f msg/s</td></tr><tr><td>Duração / drenagem</td><td>%s / %s</td></tr><tr><td>Escritas sem erro / erros de envio</td><td>%d / %d</td></tr><tr><td>Avisos de limite / sem inscritos</td><td>%d / %d</td></tr><tr><td>Duplicadas / outros erros do broker</td><td>%d / %d</td></tr><tr><td>p50 / p95</td><td>%.3f / %.3f ms</td></tr><tr><td>p99 normais / lentos</td><td>%.3f / %.3f ms</td></tr><tr><td>p99 atraso do gerador</td><td>%.3f ms</td></tr><tr><td>Descartes avisados pelo broker / na fila local</td><td>%d / %d</td></tr><tr><td>Taxa final média dos publicadores</td><td>%.2f msg/s</td></tr><tr><td>Execução interrompida</td><td>%t</td></tr></table></section>
 <section>%s</section><section>%s</section>
-<section><h2>Como interpretar</h2><p>Latência desde o instante agendado até o consumo pela aplicação. Inclui atraso do gerador, filas e eventual atraso artificial do assinante lento. Os relógios usados pertencem ao mesmo processo; percentis aproximados pelo limite superior de buckets de 2%%. Não há sincronização de relógios entre máquinas envolvida nesta medida.</p><p>Uma escrita sem erro no socket não confirma aceitação pelo broker. Entregas ausentes são pares publicação/assinante de escritas sem erro que não chegaram antes do fim da drenagem. Podem incluir rejeição por limite, descarte, falha ou atraso: não representam, isoladamente, perda de rede. Envios com erro podem ter sido parcialmente processados e não entram nesse denominador.</p><p>O cenário lento atrasa o consumo do canal da biblioteca, que também tem buffer de 256 eventos. Testes curtos podem não exercer pressão sobre o socket do broker. Estas métricas não medem CPU, memória ou motivo interno de descarte do servidor.</p><p>Execuções contra o broker de teste validam o gerador; não comprovam desempenho do middleware final. Compare percentis junto com contadores, taxa oferecida e carga pulada. Guarde resumo.json e intervalos.csv com cada experimento.</p></section></html>`, html.EscapeString(s.Config.Topico), s.Inicio.Format("2006-01-02 15:04:05Z07:00"), s.P99MS, s.Recebidas, s.Ausentes, s.Puladas, s.Config.Publicadores, s.Config.Assinantes, s.Config.Lentos, s.Config.Taxa, s.Config.Duracao, s.Config.Drenagem, s.Enviadas, s.ErrosEnvio, s.Rejeitadas, s.SemInscritos, s.Duplicadas, s.OutrosErros, s.P50MS, s.P95MS, s.P99NormaisMS, s.P99LentosMS, s.P99AtrasoGeradorMS, s.Interrompido, vazao, lat)
+<section>%s</section><section><h2>Como interpretar</h2><p>Latência desde o instante agendado até o consumo pela aplicação. Inclui atraso do gerador, filas e eventual atraso artificial do assinante lento. Os relógios usados pertencem ao mesmo processo; percentis aproximados pelo limite superior de buckets de 2%%. Não há sincronização de relógios entre máquinas envolvida nesta medida.</p><p>Uma escrita UDP sem erro no socket não confirma aceitação pelo broker. Entregas ausentes são pares publicação/assinante de escritas sem erro que não chegaram antes do fim da drenagem. Podem incluir rejeição por limite, descarte, falha ou atraso: não representam, isoladamente, perda de rede. Envios com erro podem ter sido parcialmente processados e não entram nesse denominador.</p><p>O cenário lento atrasa o consumo da aplicação. A biblioteca tem uma fila limitada e informa sua ocupação ao broker. Os avisos de descarte e as entregas ausentes têm significados diferentes; perdas no UDP podem ocorrer em qualquer direção. Estas métricas não medem CPU, memória ou motivo interno de descarte do servidor.</p><p>Execuções locais verificam esta configuração; não comprovam desempenho em outro hardware ou na Internet. A taxa média do cliente é amostrada na agenda do gerador e não equivale à vazão entregue. Compare percentis junto com contadores, taxa oferecida e carga pulada. Guarde resumo.json e intervalos.csv com cada experimento.</p></section></html>`, html.EscapeString(s.Config.Topico), s.Inicio.Format("2006-01-02 15:04:05Z07:00"), s.P99MS, s.Recebidas, s.Ausentes, s.Puladas, s.Config.Publicadores, s.Config.Assinantes, s.Config.Lentos, s.Config.Taxa, s.Config.Duracao, s.Config.Drenagem, s.Enviadas, s.ErrosEnvio, s.Rejeitadas, s.SemInscritos, s.Duplicadas, s.OutrosErros, s.P50MS, s.P95MS, s.P99NormaisMS, s.P99LentosMS, s.P99AtrasoGeradorMS, s.DescartesBroker, s.DescartesCliente, s.TaxaFinalMedia, s.Interrompido, vazao, lat, taxa)
 	return os.WriteFile(filepath.Join(dir, "relatorio.html"), []byte(page), 0644)
 }
 
@@ -95,5 +99,33 @@ func grafico(titulo, unidade string, linhas []Linha, lat bool) string {
 		fmt.Fprintf(&b, `"/><text x="%d" y="318" font-family="sans-serif" font-size="12" fill="%s">%s</text>`, 65+j*240, s.cor, s.nome)
 	}
 	fmt.Fprintf(&b, `<text x="65" y="53" font-family="sans-serif" font-size="11">%s</text><text x="65" y="290" font-family="sans-serif" font-size="11">0 s</text><text x="910" y="290" text-anchor="end" font-family="sans-serif" font-size="11">%d s</text></svg>`, unidade, n)
+	return b.String()
+}
+
+// graficoTaxa usa a mesma escala temporal dos outros gráficos.
+func graficoTaxa(linhas []Linha) string {
+	var b strings.Builder
+	max := 1.0
+	for _, l := range linhas {
+		if l.TaxaMedia > max {
+			max = l.TaxaMedia
+		}
+	}
+	fmt.Fprint(&b, `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 330" role="img" aria-label="Taxa média dos clientes"><rect width="940" height="330" fill="white"/><text x="65" y="25" font-family="sans-serif" font-size="18">Taxa média dos publicadores (msg/s)</text>`)
+	for i := 0; i <= 4; i++ {
+		y := 270 - float64(i)*50
+		fmt.Fprintf(&b, `<path d="M65 %.1fH910" stroke="#e3e8ef"/><text x="58" y="%.1f" text-anchor="end" font-family="sans-serif" font-size="11">%.1f</text>`, y, y+4, max*float64(i)/4)
+	}
+	n := len(linhas) - 1
+	if n < 1 {
+		n = 1
+	}
+	fmt.Fprint(&b, `<polyline fill="none" stroke="#8c5ace" stroke-width="2" points="`)
+	for i, l := range linhas {
+		if l.AmostrasTaxa > 0 {
+			fmt.Fprintf(&b, "%.1f,%.1f ", 65+float64(i)*845/float64(n), 270-l.TaxaMedia*200/max)
+		}
+	}
+	fmt.Fprint(&b, `"/><text x="65" y="305" font-family="sans-serif" font-size="11">Taxa de controle amostrada; não é a vazão entregue.</text></svg>`)
 	return b.String()
 }

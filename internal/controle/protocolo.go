@@ -1,6 +1,6 @@
 package controle
 
-import "github.com/Luizalima3/middleware-pubsub-go/internal/protocol"
+import "github.com/Luizalima3/middleware-pubsub-go/protocol"
 
 // Verificar deve ser chamado no broker antes de encaminhar uma publicação.
 // nil autoriza a operação. Uma resposta não nil deve ser enfileirada para o
