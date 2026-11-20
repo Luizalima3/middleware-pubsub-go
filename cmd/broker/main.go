@@ -8,6 +8,7 @@ import (
 	"github.com/Luizalima3/middleware-pubsub-go/internal/broker"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 )
 
@@ -37,7 +38,7 @@ func run() error {
 	flag.DurationVar(&c.Intervalo, "intervalo", time.Second, "período de anúncios e manutenção")
 	flag.DurationVar(&c.Inatividade, "inatividade", 5*time.Second, "expiração de clientes e interesses remotos")
 	flag.Parse()
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	b, e := broker.Iniciar(c)
 	if e != nil {

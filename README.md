@@ -130,7 +130,7 @@ Os testes usam brokers UDP reais locais. Incluem operações, repasse em um salt
 - internal/avaliacao/: carga, métricas e relatórios.
 - cmd/broker, cmd/demo, cmd/carga: executáveis principais.
 
-[Protocolo e comportamento](PROTOCOL.md) · [Biblioteca cliente](client/README.md) · [Correspondência com o documento](ADEQUACAO.md).
+[Núcleo do broker](BROKER.md) · [Protocolo e comportamento](PROTOCOL.md) · [Biblioteca cliente](client/README.md) · [Correspondência com o documento](ADEQUACAO.md).
 
 ## Limitações
 

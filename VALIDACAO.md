@@ -4,7 +4,7 @@ Verificação executada em 20/11/2026, em Windows/amd64 com Go 1.27.3. A versão
 
 ## Verificações concluídas
 
-- go test ./...: 26 testes passaram.
+- go test ./...: 28 testes passaram após integrar a main com o núcleo do PR #3.
 - go vet ./...: passou.
 - go build de todos os comandos: passou.
 - Biblioteca pública compilada por outro módulo Go, com replace local: passou.
@@ -46,4 +46,4 @@ O diretório irmão validacao-udp contém, para cada cenário, configuração, r
 - Avaliar perda/reordenação em rede e particionamento entre brokers, além dos casos automatizados locais.
 - Confirmar com o professor a interpretação de entrega como tentativa de envio e descarte sob sobrecarga.
 
-A branch do núcleo WebSocket encontrada no repositório foi preservada. Esta adaptação partiu da main fc1eaa6 em uma nova branch e mantém o histórico anterior.
+A adaptação partiu da main fc1eaa6 e depois incorporou a main 556753e, que contém o núcleo WebSocket do PR #3. O histórico foi mantido por merge. As estruturas específicas de WebSocket foram substituídas pelas equivalentes UDP; o BROKER.md, os testes de fila e o benchmark foram adaptados. Os cinco cenários acima foram executados antes desse merge; os testes automatizados, a análise e a compilação foram repetidos após a integração.

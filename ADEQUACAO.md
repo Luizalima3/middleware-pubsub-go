@@ -37,6 +37,8 @@ A identificação é estável durante a vida do cliente e declarada pelo usuári
 
 ## O que não é prometido
 
+A integração incorpora também o histórico do núcleo WebSocket que entrou na main pelo PR #3. O BROKER.md foi atualizado para UDP. Os mecanismos de fila, descarte e isolamento continuam na nova implementação; os testes de ordem e concorrência e o benchmark de inserção foram adaptados. As estruturas específicas de WebSocket deram lugar às sessões UDP, e os contadores são consultados pelo próprio protocolo, sem servidor HTTP.
+
 - Entrega confiável de cada publicação, ausência de interrupções ou ordem global.
 - Consistência imediata de tópicos em partições ou administração concorrente.
 - Proteção contra fraude de identidade e uso seguro em Internet aberta.

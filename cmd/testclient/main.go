@@ -1,4 +1,4 @@
-// Cliente de teste: usa a biblioteca internal/client.
+// Cliente de teste: usa a biblioteca pública client.
 package main
 
 import (
