@@ -7,18 +7,41 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/Luizalima3/middleware-pubsub-go/internal/controle"
-	"github.com/Luizalima3/middleware-pubsub-go/internal/recente"
-	"github.com/Luizalima3/middleware-pubsub-go/protocol"
 	"net"
 	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Luizalima3/middleware-pubsub-go/internal/controle"
+	"github.com/Luizalima3/middleware-pubsub-go/internal/recente"
+	"github.com/Luizalima3/middleware-pubsub-go/protocol"
 )
 
-var ErrDesconectado = errors.New("cliente sem broker ativo")
+var (
+	ErrDesconectado = errors.New("cliente sem broker ativo")
+	// ErrResultadoDesconhecido indica que um comando enviado pode ter sido executado,
+	// mas a biblioteca não recebeu confirmação.
+	ErrResultadoDesconhecido = errors.New("resultado da operação é desconhecido")
+)
+
+const validadeCachePedidos = 20 * time.Second
+const timeoutEscrita = time.Second
+
+func alteraEstado(tipo protocol.Tipo) bool {
+	return tipo == protocol.TipoCriarTopico ||
+		tipo == protocol.TipoApagarTopico ||
+		tipo == protocol.TipoAssinar ||
+		tipo == protocol.TipoCancelar
+}
+
+func resultadoDesconhecido(causa error) error {
+	if causa == nil {
+		return ErrResultadoDesconhecido
+	}
+	return fmt.Errorf("%w: %w", ErrResultadoDesconhecido, causa)
+}
 
 type Config struct {
 	Brokers                       []string
@@ -33,6 +56,7 @@ type Config struct {
 type pedido struct {
 	resposta chan protocol.Mensagem
 	endereco string
+	tipo     protocol.Tipo
 }
 type Client struct {
 	emEnvio             atomic.Int64
@@ -106,6 +130,10 @@ func ConectarComConfig(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Buffer < 1 || cfg.Buffer > 10000 || cfg.Intervalo < 10*time.Millisecond || cfg.Timeout < cfg.Intervalo*2 || cfg.Repeticao < time.Millisecond || cfg.Tentativas < 1 || cfg.Tentativas > 10 {
 		return nil, errors.New("configuração inválida")
 	}
+	janelaPorTentativa := (validadeCachePedidos - time.Nanosecond) / time.Duration(cfg.Tentativas)
+	if cfg.Repeticao >= janelaPorTentativa || timeoutEscrita >= janelaPorTentativa-cfg.Repeticao {
+		return nil, errors.New("a janela de repetição deve ser menor que a validade do cache de comandos do broker")
+	}
 	ad, e := controle.NovoAdaptativo(cfg.TaxaMaxima)
 	if e != nil {
 		return nil, e
@@ -154,6 +182,10 @@ func ConectarComConfig(ctx context.Context, cfg Config) (*Client, error) {
 			go c.manter()
 			return c, nil
 		}
+		if ctx.Err() != nil {
+			c.Fechar()
+			return nil, ctx.Err()
+		}
 	}
 	c.Fechar()
 	return nil, errors.New("nenhum broker respondeu")
@@ -183,25 +215,33 @@ func (c *Client) escrever(ctx context.Context, m protocol.Mensagem, a *net.UDPAd
 	}
 	c.envio.Lock()
 	defer c.envio.Unlock()
-	prazo := time.Now().Add(time.Second)
+	prazo := time.Now().Add(timeoutEscrita)
 	if d, ok := ctx.Deadline(); ok && d.Before(prazo) {
 		prazo = d
 	}
-	_ = c.conn.SetWriteDeadline(prazo)
+	if e := c.conn.SetWriteDeadline(prazo); e != nil {
+		return e
+	}
 	_, e = c.conn.WriteToUDP(dados, a)
 	return e
 }
 func (c *Client) requisitar(ctx context.Context, m protocol.Mensagem) (protocol.Mensagem, error) {
 	c.mu.Lock()
+	// As tentativas ficam no mesmo broker: o cache de IDs não é compartilhado.
 	a := c.enderecos[c.atual]
 	ch := make(chan protocol.Mensagem, 1)
-	c.pendentes[m.ID] = pedido{ch, a.String()}
+	c.pendentes[m.ID] = pedido{resposta: ch, endereco: a.String(), tipo: m.Tipo}
 	c.mu.Unlock()
 	defer func() { c.mu.Lock(); delete(c.pendentes, m.ID); c.mu.Unlock() }()
+	enviado := false
 	for tentativa := 0; tentativa < c.cfg.Tentativas; tentativa++ {
 		if e := c.escrever(ctx, m, a); e != nil {
+			if enviado && alteraEstado(m.Tipo) {
+				return protocol.Mensagem{}, resultadoDesconhecido(e)
+			}
 			return protocol.Mensagem{}, e
 		}
+		enviado = true
 		timer := time.NewTimer(c.cfg.Repeticao)
 		select {
 		case r := <-ch:
@@ -212,14 +252,23 @@ func (c *Client) requisitar(ctx context.Context, m protocol.Mensagem) (protocol.
 			return r, nil
 		case <-ctx.Done():
 			timer.Stop()
+			if enviado && alteraEstado(m.Tipo) {
+				return protocol.Mensagem{}, resultadoDesconhecido(ctx.Err())
+			}
 			return protocol.Mensagem{}, ctx.Err()
 		case <-c.ctx.Done():
 			timer.Stop()
+			if enviado && alteraEstado(m.Tipo) {
+				return protocol.Mensagem{}, resultadoDesconhecido(ErrDesconectado)
+			}
 			return protocol.Mensagem{}, ErrDesconectado
 		case <-timer.C:
 		}
 	}
-	return protocol.Mensagem{}, errors.New("sem confirmação: o resultado da operação é desconhecido")
+	if alteraEstado(m.Tipo) {
+		return protocol.Mensagem{}, fmt.Errorf("%w: sem confirmação após %d tentativas", ErrResultadoDesconhecido, c.cfg.Tentativas)
+	}
+	return protocol.Mensagem{}, errors.New("sem resposta após o limite de tentativas")
 }
 func (c *Client) atividade() protocol.Mensagem {
 	return protocol.Mensagem{Tipo: protocol.TipoAtividade, ID: c.proximo.Add(1), Fila: len(c.dados) * 100 / c.cfg.Buffer, Recebidas: c.recebidas.Load(), Perdidas: c.perdidas.Load(), Enviadas: c.enviadas.Load()}
@@ -231,11 +280,29 @@ func (c *Client) apresentar(ctx context.Context) error {
 func (c *Client) ler() {
 	defer c.wg.Done()
 	buf := make([]byte, protocol.MaxMensagem+1)
+	esperaErro := 10 * time.Millisecond
 	for {
 		n, a, e := c.conn.ReadFromUDP(buf)
 		if e != nil {
-			return
+			if c.ctx.Err() != nil {
+				return
+			}
+			timer := time.NewTimer(esperaErro)
+			select {
+			case <-c.ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			if esperaErro < 500*time.Millisecond {
+				esperaErro *= 2
+				if esperaErro > 500*time.Millisecond {
+					esperaErro = 500 * time.Millisecond
+				}
+			}
+			continue
 		}
+		esperaErro = 10 * time.Millisecond
 		m, e := protocol.Decodificar(buf[:n])
 		if e != nil {
 			continue
@@ -258,7 +325,7 @@ func (c *Client) ler() {
 			c.ultimaEstado = time.Now()
 			c.mu.Unlock()
 			c.taxa.AvaliarComDemanda(m.Fila >= 50, m.Taxa, c.emEnvio.Load() > 0 || time.Since(time.Unix(0, c.ultimoEnvio.Load())) < 2*c.cfg.Intervalo)
-			if pendente {
+			if pendente && p.tipo == protocol.TipoAtividade {
 				select {
 				case p.resposta <- m:
 				default:
@@ -266,7 +333,8 @@ func (c *Client) ler() {
 			}
 			continue
 		}
-		if (m.Tipo == protocol.TipoOK || m.Tipo == protocol.TipoErro) && m.Aviso == 0 && pendente {
+		if (m.Tipo == protocol.TipoOK || m.Tipo == protocol.TipoErro) &&
+			m.Aviso == 0 && pendente && p.tipo != protocol.TipoAtividade {
 			select {
 			case p.resposta <- m:
 			default:
@@ -373,6 +441,7 @@ func (c *Client) manter() {
 		c.conectado = false
 		inicial := c.atual
 		c.mu.Unlock()
+		// Um comando em andamento termina no endpoint original antes do failover.
 		c.comando.Lock()
 		recuperou := false
 		for passo := 0; passo < len(c.enderecos); passo++ {
@@ -453,6 +522,12 @@ func (c *Client) administrar(ctx context.Context, tipo protocol.Tipo, t string) 
 	id := c.proximo.Add(1)
 	r, e := c.requisitar(ctx, protocol.Mensagem{Tipo: tipo, ID: id, Topico: t})
 	if e != nil {
+		if errors.Is(e, ErrResultadoDesconhecido) &&
+			(tipo == protocol.TipoCancelar || tipo == protocol.TipoApagarTopico) {
+			c.mu.Lock()
+			delete(c.topicos, t)
+			c.mu.Unlock()
+		}
 		return id, e
 	}
 	c.mu.Lock()
@@ -521,10 +596,23 @@ func (c *Client) ApagarTopico(ctx context.Context, t string) (uint64, error) {
 func (c *Client) Estatisticas(ctx context.Context) (protocol.Mensagem, error) {
 	c.comando.Lock()
 	defer c.comando.Unlock()
+	c.mu.Lock()
+	viva := c.conectado
+	c.mu.Unlock()
+	if !viva {
+		return protocol.Mensagem{}, ErrDesconectado
+	}
 	return c.requisitar(ctx, protocol.Mensagem{Tipo: protocol.TipoEstatisticas, ID: c.proximo.Add(1)})
 }
 func (c *Client) Fechar() error {
-	c.uma.Do(func() { c.fechado.Store(true); c.cancel(); _ = c.conn.Close() })
+	c.uma.Do(func() {
+		c.fechado.Store(true)
+		c.mu.Lock()
+		c.conectado = false
+		c.mu.Unlock()
+		c.cancel()
+		_ = c.conn.Close()
+	})
 	c.wg.Wait()
 	return nil
 }

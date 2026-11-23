@@ -5,14 +5,16 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"github.com/Luizalima3/middleware-pubsub-go/client"
-	"github.com/Luizalima3/middleware-pubsub-go/protocol"
 	"os"
 	"os/signal"
 	"strings"
 	"time"
+
+	"github.com/Luizalima3/middleware-pubsub-go/client"
+	"github.com/Luizalima3/middleware-pubsub-go/protocol"
 )
 
 func main() {
@@ -69,6 +71,9 @@ func run() error {
 		return e
 	case "cancelar":
 		_, e = c.Cancelar(op, *topico)
+		if e == nil {
+			fmt.Println("Inscrição cancelada:", *topico)
+		}
 		return e
 	case "estatisticas":
 		m, e := c.Estatisticas(op)
@@ -76,8 +81,13 @@ func run() error {
 			return e
 		}
 		var v any
-		_ = json.Unmarshal(m.Conteudo, &v)
-		d, _ := json.MarshalIndent(v, "", "  ")
+		if e = json.Unmarshal(m.Conteudo, &v); e != nil {
+			return fmt.Errorf("resposta de estatísticas inválida: %w", e)
+		}
+		d, e := json.MarshalIndent(v, "", "  ")
+		if e != nil {
+			return fmt.Errorf("formatar estatísticas: %w", e)
+		}
 		fmt.Println(string(d))
 		return nil
 	case "assistir":
@@ -132,7 +142,11 @@ func run() error {
 
 // O mesmo cliente pode assinar e cancelar sem trocar de endpoint UDP.
 func interativo(ctx context.Context, c *client.Client) error {
-	linhas := make(chan string)
+	type linhaTerminal struct {
+		texto string
+		err   error
+	}
+	linhas := make(chan linhaTerminal)
 	fim := make(chan struct{})
 	defer close(fim)
 	go func() {
@@ -141,11 +155,18 @@ func interativo(ctx context.Context, c *client.Client) error {
 		scanner.Buffer(make([]byte, 2048), 4096)
 		for scanner.Scan() {
 			select {
-			case linhas <- scanner.Text():
+			case linhas <- linhaTerminal{texto: scanner.Text()}:
 			case <-fim:
 				return
 			case <-ctx.Done():
 				return
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			select {
+			case linhas <- linhaTerminal{err: err}:
+			case <-fim:
+			case <-ctx.Done():
 			}
 		}
 	}()
@@ -159,10 +180,14 @@ func interativo(ctx context.Context, c *client.Client) error {
 				return nil
 			}
 			fmt.Printf("Recebido: %s tópico=%s conteúdo=%s\n", m.Tipo, m.Topico, m.Conteudo)
-		case linha, ok := <-linhas:
+		case entrada, ok := <-linhas:
 			if !ok {
 				return nil
 			}
+			if entrada.err != nil {
+				return fmt.Errorf("ler entrada do terminal: %w", entrada.err)
+			}
+			linha := entrada.texto
 			p := strings.Fields(linha)
 			if len(p) == 0 {
 				continue
@@ -196,7 +221,11 @@ func interativo(ctx context.Context, c *client.Client) error {
 			}
 			cancel()
 			if e != nil {
-				fmt.Println("Erro:", e)
+				if errors.Is(e, client.ErrResultadoDesconhecido) {
+					fmt.Println("Resultado desconhecido; reconcilie o estado antes de repetir a operação:", e)
+				} else {
+					fmt.Println("Erro:", e)
+				}
 			} else if p[0] == "publicar" {
 				fmt.Println("Datagrama enviado; entrega não confirmada.")
 			} else {
