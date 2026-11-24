@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/Luizalima3/middleware-pubsub-go/internal/broker"
+	"github.com/Luizalima3/middleware-pubsub-go/internal/metricas"
 	"os"
 	"os/signal"
 	"syscall"
@@ -20,6 +21,10 @@ func main() {
 }
 func run() error {
 	var c broker.Config
+	var arquivoMetricas string
+	var intervaloMetricas time.Duration
+	flag.StringVar(&arquivoMetricas, "metricas", "", "CSV de CPU/RAM/filas; vazio desativa a coleta")
+	flag.DurationVar(&intervaloMetricas, "intervalo-metricas", 200*time.Millisecond, "intervalo de amostragem de recursos e filas")
 	flag.StringVar(&c.Endereco, "endereco", "127.0.0.1:8080", "endereço UDP local")
 	flag.StringVar(&c.Par, "par", "", "endereço UDP do outro broker")
 	flag.StringVar(&c.ID, "id", "", "identificador do broker (opcional)")
@@ -45,11 +50,29 @@ func run() error {
 		return e
 	}
 	defer b.Fechar()
+	var coleta *metricas.Coleta
+	if arquivoMetricas != "" {
+		coleta, e = metricas.Iniciar(ctx, arquivoMetricas, intervaloMetricas, b.Filas)
+		if e != nil {
+			return fmt.Errorf("iniciar métricas: %w", e)
+		}
+		defer coleta.Fechar()
+	}
 	fmt.Println(b.String())
 	if c.Par != "" {
 		fmt.Println("Par:", c.Par)
 	}
-	<-ctx.Done()
+	if coleta != nil {
+		select {
+		case <-ctx.Done():
+		case <-coleta.Concluida():
+		}
+		if e = coleta.Fechar(); e != nil {
+			return fmt.Errorf("coletar métricas: %w", e)
+		}
+	} else {
+		<-ctx.Done()
+	}
 	fmt.Printf("Contadores finais: %+v\n", b.Estatisticas())
 	return nil
 }

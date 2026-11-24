@@ -36,6 +36,19 @@ func Salvar(dir string, r Resultado) error {
 	if err = os.WriteFile(filepath.Join(dir, "intervalos.csv"), []byte(buf.String()), 0644); err != nil {
 		return err
 	}
+	buf.Reset()
+	w = csv.NewWriter(&buf)
+	w.Write([]string{"instante", "segundos", "papel", "indice", "fila", "itens", "limite_itens"})
+	for _, q := range r.Filas {
+		w.Write([]string{q.Instante.Format("2006-01-02T15:04:05.999999999Z07:00"), fmt.Sprintf("%.9f", q.Segundos), q.Papel, strconv.Itoa(q.Indice), q.Fila, strconv.Itoa(q.Itens), strconv.Itoa(q.Limite)})
+	}
+	w.Flush()
+	if err = w.Error(); err != nil {
+		return err
+	}
+	if err = os.WriteFile(filepath.Join(dir, "filas-clientes.csv"), []byte(buf.String()), 0644); err != nil {
+		return err
+	}
 	vazao := grafico("Publicações e entregas por intervalo", "contagem / intervalo de 1 s", r.Linhas, false)
 	lat := grafico("Latência p99 das entregas recebidas", "milissegundos", r.Linhas, true)
 	for name, svg := range map[string]string{"vazao.svg": vazao, "latencia.svg": lat} {
@@ -56,6 +69,9 @@ func Salvar(dir string, r Resultado) error {
 <tr><td>Publicadores / assinantes / assinantes lentos</td><td>%d / %d / %d</td></tr><tr><td>Taxa por publicador</td><td>%.2f msg/s</td></tr><tr><td>Duração / drenagem</td><td>%s / %s</td></tr><tr><td>Escritas sem erro / erros de envio</td><td>%d / %d</td></tr><tr><td>Avisos de limite / sem inscritos</td><td>%d / %d</td></tr><tr><td>Duplicadas / outros erros do broker</td><td>%d / %d</td></tr><tr><td>p50 / p95</td><td>%.3f / %.3f ms</td></tr><tr><td>p99 normais / lentos</td><td>%.3f / %.3f ms</td></tr><tr><td>p99 atraso do gerador</td><td>%.3f ms</td></tr><tr><td>Descartes avisados pelo broker / na fila local</td><td>%d / %d</td></tr><tr><td>Taxa final média dos publicadores</td><td>%.2f msg/s</td></tr><tr><td>Execução interrompida</td><td>%t</td></tr></table></section>
 <section>%s</section><section>%s</section>
 <section>%s</section><section><h2>Como interpretar</h2><p>Latência desde o instante agendado até o consumo pela aplicação. Inclui atraso do gerador, filas e eventual atraso artificial do assinante lento. Os relógios usados pertencem ao mesmo processo; percentis aproximados pelo limite superior de buckets de 2%%. Não há sincronização de relógios entre máquinas envolvida nesta medida.</p><p>Uma escrita UDP sem erro no socket não confirma aceitação pelo broker. Entregas ausentes são pares publicação/assinante de escritas sem erro que não chegaram antes do fim da drenagem. Podem incluir rejeição por limite, descarte, falha ou atraso: não representam, isoladamente, perda de rede. Envios com erro podem ter sido parcialmente processados e não entram nesse denominador.</p><p>O cenário lento atrasa o consumo da aplicação. A biblioteca tem uma fila limitada e informa sua ocupação ao broker. Os avisos de descarte e as entregas ausentes têm significados diferentes; perdas no UDP podem ocorrer em qualquer direção. Estas métricas não medem CPU, memória ou motivo interno de descarte do servidor.</p><p>Execuções locais verificam esta configuração; não comprovam desempenho em outro hardware ou na Internet. A taxa média do cliente é amostrada na agenda do gerador e não equivale à vazão entregue. Compare percentis junto com contadores, taxa oferecida e carga pulada. Guarde resumo.json e intervalos.csv com cada experimento.</p></section></html>`, html.EscapeString(s.Config.Topico), s.Inicio.Format("2006-01-02 15:04:05Z07:00"), s.P99MS, s.Recebidas, s.Ausentes, s.Puladas, s.Config.Publicadores, s.Config.Assinantes, s.Config.Lentos, s.Config.Taxa, s.Config.Duracao, s.Config.Drenagem, s.Enviadas, s.ErrosEnvio, s.Rejeitadas, s.SemInscritos, s.Duplicadas, s.OutrosErros, s.P50MS, s.P95MS, s.P99NormaisMS, s.P99LentosMS, s.P99AtrasoGeradorMS, s.DescartesBroker, s.DescartesCliente, s.TaxaFinalMedia, s.Interrompido, vazao, lat, taxa)
+	page = strings.Replace(page, "Estas métricas não medem CPU, memória ou motivo interno de descarte do servidor.", "CPU, RAM residente e filas do broker são registradas separadamente quando -metricas é habilitado no broker. O arquivo filas-clientes.csv registra as filas locais e do gerador.", 1)
+	extra := fmt.Sprintf("<section><h2>Duplicatas</h2><p>Total: %d. Descartadas pela biblioteca antes de Eventos(): %d. Detectadas pelo gerador após Eventos(): %d. As etapas são somadas sem contar o mesmo recebimento duas vezes. O reconhecimento do cliente depende do cache recente; isso não mede duplicatas perdidas antes do cliente nem as rejeitadas pelo broker.</p></section>", s.Duplicadas, s.DuplicadasCliente, s.DuplicadasGerador)
+	page = strings.Replace(page, "</html>", extra+"</html>", 1)
 	return os.WriteFile(filepath.Join(dir, "relatorio.html"), []byte(page), 0644)
 }
 

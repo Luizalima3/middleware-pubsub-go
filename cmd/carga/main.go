@@ -39,6 +39,7 @@ func run() error {
 	flag.BoolVar(&c.IgnorarControle, "ignorar-controle", false, "teste de cliente que ignora o controle de envio")
 	flag.BoolVar(&c.Distribuir, "distribuir", false, "alternar a ordem dos brokers entre os clientes")
 	flag.IntVar(&c.BufferCliente, "buffer-cliente", 32, "mensagens na fila de leitura de cada cliente")
+	flag.DurationVar(&c.IntervaloMetricas, "intervalo-metricas", 200*time.Millisecond, "amostragem das filas locais e do gerador")
 	flag.Parse()
 	for _, s := range strings.Split(brokers, ",") {
 		if s = strings.TrimSpace(s); s != "" {

@@ -20,22 +20,23 @@ import (
 )
 
 type Config struct {
-	URLs            []string      `json:"brokers"`
-	Topico          string        `json:"topico"`
-	Publicadores    int           `json:"publicadores"`
-	Assinantes      int           `json:"assinantes"`
-	Taxa            float64       `json:"taxa_por_publicador"`
-	Duracao         time.Duration `json:"duracao_ns"`
-	Drenagem        time.Duration `json:"drenagem_ns"`
-	Timeout         time.Duration `json:"timeout_ns"`
-	Payload         int           `json:"payload_bytes"`
-	Fila            int           `json:"fila_gerador"`
-	Lentos          int           `json:"assinantes_lentos"`
-	AtrasoLento     time.Duration `json:"atraso_consumo_ns"`
-	IgnorarControle bool          `json:"ignorar_controle"`
-	Distribuir      bool          `json:"distribuir_brokers"`
-	BufferCliente   int           `json:"buffer_cliente"`
-	TopicoExistente bool          `json:"usar_topico_existente"`
+	URLs              []string      `json:"brokers"`
+	Topico            string        `json:"topico"`
+	Publicadores      int           `json:"publicadores"`
+	Assinantes        int           `json:"assinantes"`
+	Taxa              float64       `json:"taxa_por_publicador"`
+	Duracao           time.Duration `json:"duracao_ns"`
+	Drenagem          time.Duration `json:"drenagem_ns"`
+	Timeout           time.Duration `json:"timeout_ns"`
+	Payload           int           `json:"payload_bytes"`
+	Fila              int           `json:"fila_gerador"`
+	Lentos            int           `json:"assinantes_lentos"`
+	AtrasoLento       time.Duration `json:"atraso_consumo_ns"`
+	IgnorarControle   bool          `json:"ignorar_controle"`
+	Distribuir        bool          `json:"distribuir_brokers"`
+	BufferCliente     int           `json:"buffer_cliente"`
+	TopicoExistente   bool          `json:"usar_topico_existente"`
+	IntervaloMetricas time.Duration `json:"intervalo_metricas_ns"`
 }
 
 func (c Config) validar() (int, error) {
@@ -79,6 +80,8 @@ type Resumo struct {
 	ErrosEnvio         uint64    `json:"erros_de_envio"`
 	Recebidas          uint64    `json:"entregas_unicas"`
 	Duplicadas         uint64    `json:"entregas_duplicadas"`
+	DuplicadasCliente  uint64    `json:"duplicatas_descartadas_pelo_cliente"`
+	DuplicadasGerador  uint64    `json:"duplicatas_detectadas_pelo_gerador"`
 	Ausentes           uint64    `json:"entregas_ausentes_entre_envios_sem_erro"`
 	Rejeitadas         uint64    `json:"avisos_rate_limit"`
 	SemInscritos       uint64    `json:"avisos_sem_inscritos"`
@@ -101,6 +104,16 @@ type Resumo struct {
 type Resultado struct {
 	Resumo Resumo
 	Linhas []Linha
+	Filas  []LinhaFila
+}
+
+type LinhaFila struct {
+	Instante      time.Time
+	Segundos      float64
+	Papel         string
+	Indice        int
+	Fila          string
+	Itens, Limite int
 }
 type coletor struct {
 	sync.Mutex
@@ -112,6 +125,8 @@ type coletor struct {
 	inicio                    time.Time
 	run                       uint64
 	n                         int
+	filasEnvio                []chan int
+	filas                     []LinhaFila
 }
 
 func (m *coletor) linha(t time.Time) *Linha {
@@ -141,6 +156,16 @@ func esperar(ctx context.Context, d time.Duration) bool {
 
 // Executar prepara clientes UDP e mede do horário programado ao consumo.
 func Executar(ctx context.Context, cfg Config) (Resultado, error) {
+	if cfg.IntervaloMetricas == 0 {
+		cfg.IntervaloMetricas = 200 * time.Millisecond
+	}
+	if cfg.IntervaloMetricas < 10*time.Millisecond || cfg.IntervaloMetricas > 10*time.Second {
+		return Resultado{}, errors.New("intervalo de métricas deve estar entre 10ms e 10s")
+	}
+	linhasMetricas := math.Ceil(float64(cfg.Duracao+cfg.Drenagem)/float64(cfg.IntervaloMetricas)) + 2
+	if linhasMetricas*float64(2*(cfg.Publicadores+cfg.Assinantes+1)+cfg.Publicadores) > 1e6 {
+		return Resultado{}, errors.New("mais de um milhão de amostras de filas; aumente o intervalo de métricas")
+	}
 	n, err := cfg.validar()
 	if err != nil {
 		return Resultado{}, err
@@ -216,9 +241,12 @@ func Executar(ctx context.Context, cfg Config) (Resultado, error) {
 	for i := range m.linhas {
 		m.linhas[i].Segundo = i
 	}
+	m.filasEnvio = make([]chan int, len(pubs))
 	readCtx, stopReaders := context.WithCancel(ctx)
 	defer stopReaders()
 	var readers sync.WaitGroup
+	readers.Add(1)
+	go func() { defer readers.Done(); m.amostrarFilas(readCtx, admin, subs, pubs) }()
 	for i, c := range subs {
 		readers.Add(1)
 		go func(i int, c *client.Client) { defer readers.Done(); m.ler(readCtx, c, i) }(i, c)
@@ -240,8 +268,12 @@ func Executar(ctx context.Context, cfg Config) (Resultado, error) {
 	stopReaders()
 	readers.Wait()
 	for _, c := range subs {
+		// Congela os contadores da biblioteca após encerrar a janela observada.
+		_ = c.Fechar()
 		m.r.DescartesCliente += c.Descartadas()
+		m.r.DuplicadasCliente += c.Duplicadas()
 	}
+	m.r.Duplicadas = m.r.DuplicadasCliente + m.r.DuplicadasGerador
 	for _, c := range pubs {
 		m.r.TaxaFinalMedia += c.Taxa()
 	}
@@ -274,11 +306,14 @@ func Executar(ctx context.Context, cfg Config) (Resultado, error) {
 			m.linhas[i].TaxaMedia /= float64(m.linhas[i].AmostrasTaxa)
 		}
 	}
-	return Resultado{m.r, m.linhas}, nil
+	return Resultado{Resumo: m.r, Linhas: m.linhas, Filas: m.filas}, nil
 }
 
 func (m *coletor) publicador(ctx context.Context, c *client.Client, p int) {
 	jobs := make(chan int, m.r.Config.Fila)
+	m.Lock()
+	m.filasEnvio[p] = jobs
+	m.Unlock()
 	var worker sync.WaitGroup
 	worker.Add(1)
 	go func() {
@@ -391,7 +426,7 @@ func (m *coletor) receber(msg protocol.Mensagem, sub int, agora time.Time) {
 	index := int(p)*m.n + int(seq)
 	bit := uint64(1) << uint(index%64)
 	if m.seen[sub][index/64]&bit != 0 {
-		m.r.Duplicadas++
+		m.r.DuplicadasGerador++
 		return
 	}
 	m.seen[sub][index/64] |= bit

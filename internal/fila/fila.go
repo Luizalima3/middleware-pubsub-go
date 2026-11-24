@@ -11,6 +11,7 @@ type Fila[T any] struct {
 	mu                        sync.Mutex
 	itens                     []item[T]
 	bytes, maxItens, maxBytes int
+	picoItens, picoBytes      int
 	Sinal                     chan struct{}
 }
 
@@ -41,6 +42,12 @@ func (f *Fila[T]) Adicionar(v T, n int, descartarAntigos bool) ([]T, bool) {
 	}
 	f.itens = append(f.itens, item[T]{v, n})
 	f.bytes += n
+	if len(f.itens) > f.picoItens {
+		f.picoItens = len(f.itens)
+	}
+	if f.bytes > f.picoBytes {
+		f.picoBytes = f.bytes
+	}
 	select {
 	case f.Sinal <- struct{}{}:
 	default:
@@ -64,6 +71,18 @@ func (f *Fila[T]) Tamanho() (int, int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.itens), f.bytes
+}
+
+// Estado é uma fotografia da fila. Picos são acumulados desde sua criação,
+// inclusive entre amostras, e não incluem itens já retirados para envio.
+type Estado struct {
+	Itens, Bytes, LimiteItens, LimiteBytes, PicoItens, PicoBytes int
+}
+
+func (f *Fila[T]) Estado() Estado {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return Estado{len(f.itens), f.bytes, f.maxItens, f.maxBytes, f.picoItens, f.picoBytes}
 }
 func (f *Fila[T]) Limpar() { f.mu.Lock(); defer f.mu.Unlock(); f.itens = nil; f.bytes = 0 }
 func (f *Fila[T]) Remover(se func(T) bool) {

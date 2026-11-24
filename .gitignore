@@ -2,3 +2,5 @@
 /*.exe
 /carga
 /bin/
+__pycache__/
+*.pyc

@@ -144,6 +144,8 @@ go run ./cmd/carga -brokers 127.0.0.1:8080,127.0.0.1:8081 -distribuir -topico te
 
 ## Testes e validação
 
+A coleta opcional de CPU, RAM e filas do broker usa `-metricas arquivo.csv`. As filas locais/do gerador também são registradas, e o resumo separa duplicatas filtradas pela biblioteca das detectadas na aplicação. Para repetir os cinco cenários e gerar comparações, siga o [guia da avaliação](experimentos/README.md).
+
 ```sh
 go test ./... -count=1
 go test ./client -count=5

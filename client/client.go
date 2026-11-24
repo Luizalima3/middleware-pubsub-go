@@ -63,6 +63,7 @@ type Client struct {
 	ultimoEnvio         atomic.Int64
 	ultimaEstado        time.Time
 	enviadas            atomic.Uint64
+	duplicadas          atomic.Uint64
 	cfg                 Config
 	conn                *net.UDPConn
 	enderecos           []*net.UDPAddr
@@ -366,6 +367,7 @@ func (c *Client) ler() {
 		}
 		k := m.Cliente + ":" + fmt.Sprint(m.ID)
 		if _, ok := c.vistos.Buscar(k); ok {
+			c.duplicadas.Add(1)
 			continue
 		}
 		c.vistos.Guardar(k, true)
@@ -615,4 +617,16 @@ func (c *Client) Fechar() error {
 	})
 	c.wg.Wait()
 	return nil
+}
+
+// Duplicadas conta entregas MENSAGEM descartadas pela deduplicação local.
+// Não inclui avisos repetidos nem garante reconhecer duplicatas após o cache expirar.
+// O contador é acumulado durante toda a vida desta instância do cliente.
+func (c *Client) Duplicadas() uint64 { return c.duplicadas.Load() }
+
+// EstadoFilas é uma amostra das duas filas locais, não uma fotografia atômica.
+type EstadoFilas struct{ Dados, LimiteDados, Avisos, LimiteAvisos int }
+
+func (c *Client) Filas() EstadoFilas {
+	return EstadoFilas{len(c.dados), cap(c.dados), len(c.avisos), cap(c.avisos)}
 }
