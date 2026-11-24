@@ -2,6 +2,8 @@
 
 Esta parte mede o processo do broker e repete cinco cenários com parâmetros registrados. O protocolo UDP e as regras de tráfego continuam os mesmos.
 
+O [lote final publicado](resultados/README.md) já contém os gráficos, CSVs, análise e dados das 15 execuções. Para apenas consultar os resultados, não é necessário executar os comandos abaixo.
+
 ## Rodar tudo
 
 Precisa de Go, Python 3.10 ou superior e Matplotlib para os gráficos. Os executáveis Go continuam sem dependências externas. Na raiz do projeto:

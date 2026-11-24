@@ -56,7 +56,7 @@ def texto_html(text):
 
 
 def analisar(root, run):
-    path = root/run["pasta"]
+    path = root/Path(run["pasta"].replace("\\", "/"))
     s = json.loads((path/"resumo.json").read_text(encoding="utf-8"))
     start = instante(s["inicio"])
     duration = s["janela_observada_segundos"]

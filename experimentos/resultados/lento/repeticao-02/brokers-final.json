@@ -1,0 +1,23 @@
+[
+  {
+    "broker": 1,
+    "estatisticas": {
+      "interesses_remotos": 0,
+      "pendencias_controle": 0,
+      "recebidas": 578,
+      "aceitas": 578,
+      "rejeitadas": 0,
+      "entregas_enviadas": 1023,
+      "descartadas": 84,
+      "invalidas": 0,
+      "controle_sem_confirmacao": 0,
+      "duplicadas": 0,
+      "repasses": 0,
+      "bytes_enviados": 274207,
+      "clientes": 6,
+      "topicos": 1,
+      "fila_entrada": 0,
+      "fila_saida": 48
+    }
+  }
+]

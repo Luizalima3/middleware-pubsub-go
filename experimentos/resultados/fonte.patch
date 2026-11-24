@@ -1,0 +1,1453 @@
+diff --git a/.gitignore b/.gitignore
+index 55b0392..d15e25f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,3 +2,5 @@
+ /*.exe
+ /carga
+ /bin/
++__pycache__/
++*.pyc
+diff --git a/README.md b/README.md
+index 50e6a3b..b8a55f9 100644
+--- a/README.md
++++ b/README.md
+@@ -144,6 +144,8 @@ go run ./cmd/carga -brokers 127.0.0.1:8080,127.0.0.1:8081 -distribuir -topico te
+ 
+ ## Testes e validação
+ 
++A coleta opcional de CPU, RAM e filas do broker usa `-metricas arquivo.csv`. As filas locais/do gerador também são registradas, e o resumo separa duplicatas filtradas pela biblioteca das detectadas na aplicação. Para repetir os cinco cenários e gerar comparações, siga o [guia da avaliação](experimentos/README.md).
++
+ ```sh
+ go test ./... -count=1
+ go test ./client -count=5
+diff --git a/client/client.go b/client/client.go
+index 75267d5..8f8724e 100644
+--- a/client/client.go
++++ b/client/client.go
+@@ -63,6 +63,7 @@ type Client struct {
+ 	ultimoEnvio         atomic.Int64
+ 	ultimaEstado        time.Time
+ 	enviadas            atomic.Uint64
++	duplicadas          atomic.Uint64
+ 	cfg                 Config
+ 	conn                *net.UDPConn
+ 	enderecos           []*net.UDPAddr
+@@ -366,6 +367,7 @@ func (c *Client) ler() {
+ 		}
+ 		k := m.Cliente + ":" + fmt.Sprint(m.ID)
+ 		if _, ok := c.vistos.Buscar(k); ok {
++			c.duplicadas.Add(1)
+ 			continue
+ 		}
+ 		c.vistos.Guardar(k, true)
+@@ -616,3 +618,15 @@ func (c *Client) Fechar() error {
+ 	c.wg.Wait()
+ 	return nil
+ }
++
++// Duplicadas conta entregas MENSAGEM descartadas pela deduplicação local.
++// Não inclui avisos repetidos nem garante reconhecer duplicatas após o cache expirar.
++// O contador é acumulado durante toda a vida desta instância do cliente.
++func (c *Client) Duplicadas() uint64 { return c.duplicadas.Load() }
++
++// EstadoFilas é uma amostra das duas filas locais, não uma fotografia atômica.
++type EstadoFilas struct{ Dados, LimiteDados, Avisos, LimiteAvisos int }
++
++func (c *Client) Filas() EstadoFilas {
++	return EstadoFilas{len(c.dados), cap(c.dados), len(c.avisos), cap(c.avisos)}
++}
+diff --git a/cmd/broker/main.go b/cmd/broker/main.go
+index 16eaf1c..314cd85 100644
+--- a/cmd/broker/main.go
++++ b/cmd/broker/main.go
+@@ -6,6 +6,7 @@ import (
+ 	"flag"
+ 	"fmt"
+ 	"github.com/Luizalima3/middleware-pubsub-go/internal/broker"
++	"github.com/Luizalima3/middleware-pubsub-go/internal/metricas"
+ 	"os"
+ 	"os/signal"
+ 	"syscall"
+@@ -20,6 +21,10 @@ func main() {
+ }
+ func run() error {
+ 	var c broker.Config
++	var arquivoMetricas string
++	var intervaloMetricas time.Duration
++	flag.StringVar(&arquivoMetricas, "metricas", "", "CSV de CPU/RAM/filas; vazio desativa a coleta")
++	flag.DurationVar(&intervaloMetricas, "intervalo-metricas", 200*time.Millisecond, "intervalo de amostragem de recursos e filas")
+ 	flag.StringVar(&c.Endereco, "endereco", "127.0.0.1:8080", "endereço UDP local")
+ 	flag.StringVar(&c.Par, "par", "", "endereço UDP do outro broker")
+ 	flag.StringVar(&c.ID, "id", "", "identificador do broker (opcional)")
+@@ -45,11 +50,29 @@ func run() error {
+ 		return e
+ 	}
+ 	defer b.Fechar()
++	var coleta *metricas.Coleta
++	if arquivoMetricas != "" {
++		coleta, e = metricas.Iniciar(ctx, arquivoMetricas, intervaloMetricas, b.Filas)
++		if e != nil {
++			return fmt.Errorf("iniciar métricas: %w", e)
++		}
++		defer coleta.Fechar()
++	}
+ 	fmt.Println(b.String())
+ 	if c.Par != "" {
+ 		fmt.Println("Par:", c.Par)
+ 	}
+-	<-ctx.Done()
++	if coleta != nil {
++		select {
++		case <-ctx.Done():
++		case <-coleta.Concluida():
++		}
++		if e = coleta.Fechar(); e != nil {
++			return fmt.Errorf("coletar métricas: %w", e)
++		}
++	} else {
++		<-ctx.Done()
++	}
+ 	fmt.Printf("Contadores finais: %+v\n", b.Estatisticas())
+ 	return nil
+ }
+diff --git a/cmd/carga/main.go b/cmd/carga/main.go
+index 49a3fa5..b678dc5 100644
+--- a/cmd/carga/main.go
++++ b/cmd/carga/main.go
+@@ -39,6 +39,7 @@ func run() error {
+ 	flag.BoolVar(&c.IgnorarControle, "ignorar-controle", false, "teste de cliente que ignora o controle de envio")
+ 	flag.BoolVar(&c.Distribuir, "distribuir", false, "alternar a ordem dos brokers entre os clientes")
+ 	flag.IntVar(&c.BufferCliente, "buffer-cliente", 32, "mensagens na fila de leitura de cada cliente")
++	flag.DurationVar(&c.IntervaloMetricas, "intervalo-metricas", 200*time.Millisecond, "amostragem das filas locais e do gerador")
+ 	flag.Parse()
+ 	for _, s := range strings.Split(brokers, ",") {
+ 		if s = strings.TrimSpace(s); s != "" {
+diff --git a/experimentos/README.md b/experimentos/README.md
+new file mode 100644
+index 0000000..e44507e
+--- /dev/null
++++ b/experimentos/README.md
+@@ -0,0 +1,77 @@
++# Avaliação: CPU, memória, filas e duplicatas
++
++Esta parte mede o processo do broker e repete cinco cenários com parâmetros registrados. O protocolo UDP e as regras de tráfego continuam os mesmos.
++
++## Rodar tudo
++
++Precisa de Go, Python 3.10 ou superior e Matplotlib para os gráficos. Os executáveis Go continuam sem dependências externas. Na raiz do projeto:
++
++```sh
++python -m pip install -r scripts/requirements.txt
++python scripts/experimentos.py --saida resultados/comparacao-01
++```
++
++O script testa e compila os executáveis, inicia brokers novos, repete cada cenário três vezes e gera a comparação. Use uma pasta nova a cada lote: resultados anteriores não são sobrescritos. Os cenários usam as mesmas cargas da verificação anterior, agora com coleta em intervalos de 200 ms. A configuração está em configuracao.json; a ordem é alternada com uma semente fixa.
++
++Para executar apenas a coleta sem instalar a biblioteca de gráficos:
++
++```sh
++python scripts/experimentos.py --saida resultados/comparacao-02 --sem-graficos
++```
++
++Depois, os gráficos podem ser refeitos sem repetir a carga:
++
++```sh
++python scripts/comparar.py --entrada resultados/comparacao-02
++```
++
++`--go caminho/do/go` escolhe o compilador. `--sem-testes` só deve ser usado se a mesma revisão já foi verificada. Os processos são locais, sem outras cargas intencionais concorrentes; outros programas da máquina podem interferir nos tempos.
++
++## O que é medido
++
++| Medida | Como é obtida | Onde fica |
++| --- | --- | --- |
++| CPU do broker | Diferença de tempo de usuário + kernel / tempo decorrido | broker-N.csv |
++| RAM do broker | Memória residente atual do processo | broker-N.csv |
++| Filas do broker | Itens, bytes, limites e picos por tópico/sessão; controle e par | broker-N.csv |
++| Filas locais | Dados/avisos da biblioteca e fila de envio do gerador | filas-clientes.csv |
++| Duplicatas filtradas | Contador Client.Duplicadas(), antes de Eventos() | resumo.json |
++| Duplicatas no gerador | Repetição do identificador da publicação após Eventos() | resumo.json |
++
++CPU de 100% significa um núcleo lógico ocupado. Pode passar de 100%. O CSV também inclui o valor dividido pelo número de CPUs lógicas: `cpu_pct_maquina`. A primeira amostra não tem percentual porque ainda não há um intervalo anterior. RAM é o working set no Windows e a parte residente de /proc/self/statm no Linux; não é apenas heap Go. A coleta nativa é implementada para Windows e Linux; outros sistemas podem executar o broker sem `-metricas`.
++
++Fontes das medidas Windows: [GetProcessTimes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes), [GetProcessMemoryInfo](https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-getprocessmemoryinfo) e [WorkingSetSize](https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-process_memory_counters_ex).
++
++As filas de dados mantêm picos desde sua criação, atualizados em cada inserção. Assim, uma rajada pode aparecer no pico mesmo que termine entre amostras. As filas locais e a fila de controle têm somente amostragem de ocupação. Campos de bytes/picos não medidos na fila de controle ficam vazios. Itens já retirados para envio não estão na fila; `em_envio` sinaliza esse estágio separadamente.
++
++Para coletar manualmente:
++
++```sh
++go run ./cmd/broker -endereco 127.0.0.1:8080 -metricas resultados/manual/broker.csv -intervalo-metricas 200ms
++go run ./cmd/carga -duracao 10s -saida resultados/manual -intervalo-metricas 200ms
++```
++
++## Arquivos da comparação
++
++- relatorio-comparativo.html: gráfico geral, explicação e séries da primeira repetição.
++- ANALISE.md: análise em texto, com mediana, mínimo e máximo por cenário.
++- comparativo.csv: uma linha por execução; comparativo.json inclui cobertura de CPU por broker.
++- comparativo.png e comparativo.svg: gráficos para apresentação.
++- series-CENARIO-NN.png: CPU, RAM e filas de cada repetição.
++- manifesto.json: ambiente, ordem, revisão base, patch e hashes dos binários/scripts/configuração.
++- fonte.patch: alterações em relação à revisão base; pode ser vazio se a revisão estiver salva em commit.
++- Pastas dos cenários: resumo, CSVs, logs, comandos executados e contadores finais.
++
++CPU é comparada pelo tempo acumulado em intervalos inteiramente dentro da janela de carga+drenagem, dividido pela duração observada. A cobertura por broker é explícita; bordas de amostragem e a última fração antes de um término forçado não são extrapoladas. RAM agregada é a soma de picos amostrados por processo, que podem não ser simultâneos nem representar páginas físicas exclusivas.
++
++## Duplicatas: a correção feita
++
++Antes, o gerador só contava repetições que chegassem por Eventos(). A biblioteca já descartava algumas delas silenciosamente. Agora o resumo separa `duplicatas_descartadas_pelo_cliente` e `duplicatas_detectadas_pelo_gerador`, e `entregas_duplicadas` é a soma. Cada recebimento removido na primeira etapa não chega à segunda.
++
++O teste TestDuplicatasFiltradasPeloClienteChegamAoResumo injeta três cópias de cada mensagem e verifica três entregas únicas e seis duplicatas para três publicações. Isso verifica a contabilização; não simula uma taxa de duplicação espontânea. Os caches são limitados, e esses contadores não medem duplicatas descartadas antes do cliente.
++
++## Como apresentar sem exagerar a conclusão
++
++Cada cenário repete sua própria configuração. Normal, lento, excesso, dois brokers e falha têm cargas diferentes entre si, preservadas na configuração; a comparação é descritiva. As barras mostram mediana e as hastes mínimo–máximo, sem teste de significância. Ausências, rejeições e descartes não são causas independentes e não devem ser somados.
++
++No cenário lento, examine os consumidores normais separadamente do atraso artificial. No excesso, o cliente ignora o limitador local para testar o broker. Na falha, o primeiro broker é terminado dois segundos após lançar o gerador; a retomada é verificada, mas não se mede automaticamente o tempo exato de indisponibilidade. Todas as repetições usam instrumentação; seu custo adicional não foi isolado. Os testes locais não comprovam capacidade de produção.
+diff --git a/experimentos/configuracao.json b/experimentos/configuracao.json
+new file mode 100644
+index 0000000..cb7d92b
+--- /dev/null
++++ b/experimentos/configuracao.json
+@@ -0,0 +1,22 @@
++{
++  "repeticoes": 3,
++  "semente_ordem": 2026,
++  "aquecimento_segundos": 0.5,
++  "intervalo_metricas": "200ms",
++  "carga_comum": {
++    "payload": 128, "fila": 64, "drenagem": "1s", "timeout": "5s", "buffer-cliente": 32
++  },
++  "broker_comum": {
++    "teto-cliente": 500, "teto-entrada": 1000, "teto-saida": 3000,
++    "teto-controle": 500, "teto-par": 1000, "rajada": 8, "intervalo": "250ms",
++    "inatividade": "5s", "fila-topico": 128, "fila-cliente": 64,
++    "bytes-topico": 128000, "bytes-cliente": 64000, "max-clientes": 256, "max-topicos": 128
++  },
++  "cenarios": [
++    {"nome": "normal", "brokers": 1, "carga": {"publicadores": 2, "assinantes": 3, "taxa": 15, "duracao": "3s"}},
++    {"nome": "lento", "brokers": 1, "carga": {"publicadores": 2, "assinantes": 2, "taxa": 60, "duracao": "5s", "lentos": 1, "atraso-lento": "100ms", "buffer-cliente": 2}},
++    {"nome": "excesso", "brokers": 1, "broker": {"teto-cliente": 30}, "carga": {"publicadores": 1, "assinantes": 2, "taxa": 300, "duracao": "3s", "ignorar-controle": true}},
++    {"nome": "dois-brokers", "brokers": 2, "carga": {"publicadores": 1, "assinantes": 3, "taxa": 20, "duracao": "3s", "distribuir": true}},
++    {"nome": "falha", "brokers": 2, "encerrar_primeiro_apos_segundos": 2, "carga": {"publicadores": 1, "assinantes": 2, "taxa": 20, "duracao": "8s"}}
++  ]
++}
+diff --git a/internal/avaliacao/carga.go b/internal/avaliacao/carga.go
+index 7325a63..982f49a 100644
+--- a/internal/avaliacao/carga.go
++++ b/internal/avaliacao/carga.go
+@@ -20,22 +20,23 @@ import (
+ )
+ 
+ type Config struct {
+-	URLs            []string      `json:"brokers"`
+-	Topico          string        `json:"topico"`
+-	Publicadores    int           `json:"publicadores"`
+-	Assinantes      int           `json:"assinantes"`
+-	Taxa            float64       `json:"taxa_por_publicador"`
+-	Duracao         time.Duration `json:"duracao_ns"`
+-	Drenagem        time.Duration `json:"drenagem_ns"`
+-	Timeout         time.Duration `json:"timeout_ns"`
+-	Payload         int           `json:"payload_bytes"`
+-	Fila            int           `json:"fila_gerador"`
+-	Lentos          int           `json:"assinantes_lentos"`
+-	AtrasoLento     time.Duration `json:"atraso_consumo_ns"`
+-	IgnorarControle bool          `json:"ignorar_controle"`
+-	Distribuir      bool          `json:"distribuir_brokers"`
+-	BufferCliente   int           `json:"buffer_cliente"`
+-	TopicoExistente bool          `json:"usar_topico_existente"`
++	URLs              []string      `json:"brokers"`
++	Topico            string        `json:"topico"`
++	Publicadores      int           `json:"publicadores"`
++	Assinantes        int           `json:"assinantes"`
++	Taxa              float64       `json:"taxa_por_publicador"`
++	Duracao           time.Duration `json:"duracao_ns"`
++	Drenagem          time.Duration `json:"drenagem_ns"`
++	Timeout           time.Duration `json:"timeout_ns"`
++	Payload           int           `json:"payload_bytes"`
++	Fila              int           `json:"fila_gerador"`
++	Lentos            int           `json:"assinantes_lentos"`
++	AtrasoLento       time.Duration `json:"atraso_consumo_ns"`
++	IgnorarControle   bool          `json:"ignorar_controle"`
++	Distribuir        bool          `json:"distribuir_brokers"`
++	BufferCliente     int           `json:"buffer_cliente"`
++	TopicoExistente   bool          `json:"usar_topico_existente"`
++	IntervaloMetricas time.Duration `json:"intervalo_metricas_ns"`
+ }
+ 
+ func (c Config) validar() (int, error) {
+@@ -79,6 +80,8 @@ type Resumo struct {
+ 	ErrosEnvio         uint64    `json:"erros_de_envio"`
+ 	Recebidas          uint64    `json:"entregas_unicas"`
+ 	Duplicadas         uint64    `json:"entregas_duplicadas"`
++	DuplicadasCliente  uint64    `json:"duplicatas_descartadas_pelo_cliente"`
++	DuplicadasGerador  uint64    `json:"duplicatas_detectadas_pelo_gerador"`
+ 	Ausentes           uint64    `json:"entregas_ausentes_entre_envios_sem_erro"`
+ 	Rejeitadas         uint64    `json:"avisos_rate_limit"`
+ 	SemInscritos       uint64    `json:"avisos_sem_inscritos"`
+@@ -101,6 +104,16 @@ type Resumo struct {
+ type Resultado struct {
+ 	Resumo Resumo
+ 	Linhas []Linha
++	Filas  []LinhaFila
++}
++
++type LinhaFila struct {
++	Instante      time.Time
++	Segundos      float64
++	Papel         string
++	Indice        int
++	Fila          string
++	Itens, Limite int
+ }
+ type coletor struct {
+ 	sync.Mutex
+@@ -112,6 +125,8 @@ type coletor struct {
+ 	inicio                    time.Time
+ 	run                       uint64
+ 	n                         int
++	filasEnvio                []chan int
++	filas                     []LinhaFila
+ }
+ 
+ func (m *coletor) linha(t time.Time) *Linha {
+@@ -141,6 +156,16 @@ func esperar(ctx context.Context, d time.Duration) bool {
+ 
+ // Executar prepara clientes UDP e mede do horário programado ao consumo.
+ func Executar(ctx context.Context, cfg Config) (Resultado, error) {
++	if cfg.IntervaloMetricas == 0 {
++		cfg.IntervaloMetricas = 200 * time.Millisecond
++	}
++	if cfg.IntervaloMetricas < 10*time.Millisecond || cfg.IntervaloMetricas > 10*time.Second {
++		return Resultado{}, errors.New("intervalo de métricas deve estar entre 10ms e 10s")
++	}
++	linhasMetricas := math.Ceil(float64(cfg.Duracao+cfg.Drenagem)/float64(cfg.IntervaloMetricas)) + 2
++	if linhasMetricas*float64(2*(cfg.Publicadores+cfg.Assinantes+1)+cfg.Publicadores) > 1e6 {
++		return Resultado{}, errors.New("mais de um milhão de amostras de filas; aumente o intervalo de métricas")
++	}
+ 	n, err := cfg.validar()
+ 	if err != nil {
+ 		return Resultado{}, err
+@@ -216,9 +241,12 @@ func Executar(ctx context.Context, cfg Config) (Resultado, error) {
+ 	for i := range m.linhas {
+ 		m.linhas[i].Segundo = i
+ 	}
++	m.filasEnvio = make([]chan int, len(pubs))
+ 	readCtx, stopReaders := context.WithCancel(ctx)
+ 	defer stopReaders()
+ 	var readers sync.WaitGroup
++	readers.Add(1)
++	go func() { defer readers.Done(); m.amostrarFilas(readCtx, admin, subs, pubs) }()
+ 	for i, c := range subs {
+ 		readers.Add(1)
+ 		go func(i int, c *client.Client) { defer readers.Done(); m.ler(readCtx, c, i) }(i, c)
+@@ -240,8 +268,12 @@ func Executar(ctx context.Context, cfg Config) (Resultado, error) {
+ 	stopReaders()
+ 	readers.Wait()
+ 	for _, c := range subs {
++		// Congela os contadores da biblioteca após encerrar a janela observada.
++		_ = c.Fechar()
+ 		m.r.DescartesCliente += c.Descartadas()
++		m.r.DuplicadasCliente += c.Duplicadas()
+ 	}
++	m.r.Duplicadas = m.r.DuplicadasCliente + m.r.DuplicadasGerador
+ 	for _, c := range pubs {
+ 		m.r.TaxaFinalMedia += c.Taxa()
+ 	}
+@@ -274,11 +306,14 @@ func Executar(ctx context.Context, cfg Config) (Resultado, error) {
+ 			m.linhas[i].TaxaMedia /= float64(m.linhas[i].AmostrasTaxa)
+ 		}
+ 	}
+-	return Resultado{m.r, m.linhas}, nil
++	return Resultado{Resumo: m.r, Linhas: m.linhas, Filas: m.filas}, nil
+ }
+ 
+ func (m *coletor) publicador(ctx context.Context, c *client.Client, p int) {
+ 	jobs := make(chan int, m.r.Config.Fila)
++	m.Lock()
++	m.filasEnvio[p] = jobs
++	m.Unlock()
+ 	var worker sync.WaitGroup
+ 	worker.Add(1)
+ 	go func() {
+@@ -391,7 +426,7 @@ func (m *coletor) receber(msg protocol.Mensagem, sub int, agora time.Time) {
+ 	index := int(p)*m.n + int(seq)
+ 	bit := uint64(1) << uint(index%64)
+ 	if m.seen[sub][index/64]&bit != 0 {
+-		m.r.Duplicadas++
++		m.r.DuplicadasGerador++
+ 		return
+ 	}
+ 	m.seen[sub][index/64] |= bit
+diff --git a/internal/avaliacao/duplicatas_test.go b/internal/avaliacao/duplicatas_test.go
+new file mode 100644
+index 0000000..d7e8533
+--- /dev/null
++++ b/internal/avaliacao/duplicatas_test.go
+@@ -0,0 +1,69 @@
++package avaliacao
++
++import (
++	"context"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/Luizalima3/middleware-pubsub-go/protocol"
++)
++
++// Um broker UDP de teste injeta cada entrega três vezes. A biblioteca entrega
++// apenas uma à aplicação; o resumo deve enxergar também as outras duas.
++func TestDuplicatasFiltradasPeloClienteChegamAoResumo(t *testing.T) {
++	s, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		var sub *net.UDPAddr
++		buf := make([]byte, 1001)
++		enviar := func(m protocol.Mensagem, a *net.UDPAddr) {
++			d, e := protocol.Codificar(m)
++			if e == nil {
++				s.WriteToUDP(d, a)
++			}
++		}
++		for {
++			n, a, e := s.ReadFromUDP(buf)
++			if e != nil {
++				return
++			}
++			m, e := protocol.Decodificar(buf[:n])
++			if e != nil {
++				continue
++			}
++			switch m.Tipo {
++			case protocol.TipoAtividade:
++				enviar(protocol.Mensagem{Tipo: protocol.TipoEstado, ID: m.ID, Taxa: 100}, a)
++			case protocol.TipoCriarTopico, protocol.TipoAssinar:
++				if m.Tipo == protocol.TipoAssinar {
++					sub = a
++				}
++				enviar(protocol.Mensagem{Tipo: protocol.TipoOK, ID: m.ID, Topico: m.Topico}, a)
++			case protocol.TipoPublicar:
++				m.Tipo = protocol.TipoMensagem
++				if sub != nil {
++					for i := 0; i < 3; i++ {
++						enviar(m, sub)
++					}
++				}
++			}
++		}
++	}()
++	defer func() { s.Close(); <-done }()
++	cfg := Config{URLs: []string{s.LocalAddr().String()}, Topico: "teste/duplicatas", Publicadores: 1, Assinantes: 1, Taxa: 10, Duracao: 300 * time.Millisecond, Drenagem: 300 * time.Millisecond, Timeout: time.Second, Payload: 128, Fila: 8}
++	r, e := Executar(context.Background(), cfg)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if r.Resumo.Enviadas != 3 || r.Resumo.Recebidas != 3 || r.Resumo.DuplicadasCliente != 6 || r.Resumo.DuplicadasGerador != 0 || r.Resumo.Duplicadas != 6 {
++		t.Fatalf("%+v", r.Resumo)
++	}
++	if len(r.Filas) == 0 {
++		t.Fatal("não amostrou filas locais")
++	}
++}
+diff --git a/internal/avaliacao/filas.go b/internal/avaliacao/filas.go
+new file mode 100644
+index 0000000..224083f
+--- /dev/null
++++ b/internal/avaliacao/filas.go
+@@ -0,0 +1,46 @@
++package avaliacao
++
++import (
++	"context"
++	"time"
++
++	"github.com/Luizalima3/middleware-pubsub-go/client"
++)
++
++func (m *coletor) amostrarFilas(ctx context.Context, admin *client.Client, subs, pubs []*client.Client) {
++	amostrar := func() {
++		now := time.Now()
++		if now.Before(m.inicio) {
++			return
++		}
++		m.Lock()
++		defer m.Unlock()
++		registrar := func(papel string, i int, c *client.Client) {
++			q := c.Filas()
++			m.filas = append(m.filas, LinhaFila{now, now.Sub(m.inicio).Seconds(), papel, i, "dados", q.Dados, q.LimiteDados}, LinhaFila{now, now.Sub(m.inicio).Seconds(), papel, i, "avisos", q.Avisos, q.LimiteAvisos})
++		}
++		registrar("admin", 0, admin)
++		for i, c := range subs {
++			registrar("assinante", i, c)
++		}
++		for i, c := range pubs {
++			registrar("publicador", i, c)
++		}
++		for i, q := range m.filasEnvio {
++			if q != nil {
++				m.filas = append(m.filas, LinhaFila{now, now.Sub(m.inicio).Seconds(), "publicador", i, "gerador", len(q), cap(q)})
++			}
++		}
++	}
++	ticker := time.NewTicker(m.r.Config.IntervaloMetricas)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			amostrar()
++			return
++		case <-ticker.C:
++			amostrar()
++		}
++	}
++}
+diff --git a/internal/avaliacao/relatorio.go b/internal/avaliacao/relatorio.go
+index ffcd7db..650528c 100644
+--- a/internal/avaliacao/relatorio.go
++++ b/internal/avaliacao/relatorio.go
+@@ -36,6 +36,19 @@ func Salvar(dir string, r Resultado) error {
+ 	if err = os.WriteFile(filepath.Join(dir, "intervalos.csv"), []byte(buf.String()), 0644); err != nil {
+ 		return err
+ 	}
++	buf.Reset()
++	w = csv.NewWriter(&buf)
++	w.Write([]string{"instante", "segundos", "papel", "indice", "fila", "itens", "limite_itens"})
++	for _, q := range r.Filas {
++		w.Write([]string{q.Instante.Format("2006-01-02T15:04:05.999999999Z07:00"), fmt.Sprintf("%.9f", q.Segundos), q.Papel, strconv.Itoa(q.Indice), q.Fila, strconv.Itoa(q.Itens), strconv.Itoa(q.Limite)})
++	}
++	w.Flush()
++	if err = w.Error(); err != nil {
++		return err
++	}
++	if err = os.WriteFile(filepath.Join(dir, "filas-clientes.csv"), []byte(buf.String()), 0644); err != nil {
++		return err
++	}
+ 	vazao := grafico("Publicações e entregas por intervalo", "contagem / intervalo de 1 s", r.Linhas, false)
+ 	lat := grafico("Latência p99 das entregas recebidas", "milissegundos", r.Linhas, true)
+ 	for name, svg := range map[string]string{"vazao.svg": vazao, "latencia.svg": lat} {
+@@ -56,6 +69,9 @@ func Salvar(dir string, r Resultado) error {
+ <tr><td>Publicadores / assinantes / assinantes lentos</td><td>%d / %d / %d</td></tr><tr><td>Taxa por publicador</td><td>%.2f msg/s</td></tr><tr><td>Duração / drenagem</td><td>%s / %s</td></tr><tr><td>Escritas sem erro / erros de envio</td><td>%d / %d</td></tr><tr><td>Avisos de limite / sem inscritos</td><td>%d / %d</td></tr><tr><td>Duplicadas / outros erros do broker</td><td>%d / %d</td></tr><tr><td>p50 / p95</td><td>%.3f / %.3f ms</td></tr><tr><td>p99 normais / lentos</td><td>%.3f / %.3f ms</td></tr><tr><td>p99 atraso do gerador</td><td>%.3f ms</td></tr><tr><td>Descartes avisados pelo broker / na fila local</td><td>%d / %d</td></tr><tr><td>Taxa final média dos publicadores</td><td>%.2f msg/s</td></tr><tr><td>Execução interrompida</td><td>%t</td></tr></table></section>
+ <section>%s</section><section>%s</section>
+ <section>%s</section><section><h2>Como interpretar</h2><p>Latência desde o instante agendado até o consumo pela aplicação. Inclui atraso do gerador, filas e eventual atraso artificial do assinante lento. Os relógios usados pertencem ao mesmo processo; percentis aproximados pelo limite superior de buckets de 2%%. Não há sincronização de relógios entre máquinas envolvida nesta medida.</p><p>Uma escrita UDP sem erro no socket não confirma aceitação pelo broker. Entregas ausentes são pares publicação/assinante de escritas sem erro que não chegaram antes do fim da drenagem. Podem incluir rejeição por limite, descarte, falha ou atraso: não representam, isoladamente, perda de rede. Envios com erro podem ter sido parcialmente processados e não entram nesse denominador.</p><p>O cenário lento atrasa o consumo da aplicação. A biblioteca tem uma fila limitada e informa sua ocupação ao broker. Os avisos de descarte e as entregas ausentes têm significados diferentes; perdas no UDP podem ocorrer em qualquer direção. Estas métricas não medem CPU, memória ou motivo interno de descarte do servidor.</p><p>Execuções locais verificam esta configuração; não comprovam desempenho em outro hardware ou na Internet. A taxa média do cliente é amostrada na agenda do gerador e não equivale à vazão entregue. Compare percentis junto com contadores, taxa oferecida e carga pulada. Guarde resumo.json e intervalos.csv com cada experimento.</p></section></html>`, html.EscapeString(s.Config.Topico), s.Inicio.Format("2006-01-02 15:04:05Z07:00"), s.P99MS, s.Recebidas, s.Ausentes, s.Puladas, s.Config.Publicadores, s.Config.Assinantes, s.Config.Lentos, s.Config.Taxa, s.Config.Duracao, s.Config.Drenagem, s.Enviadas, s.ErrosEnvio, s.Rejeitadas, s.SemInscritos, s.Duplicadas, s.OutrosErros, s.P50MS, s.P95MS, s.P99NormaisMS, s.P99LentosMS, s.P99AtrasoGeradorMS, s.DescartesBroker, s.DescartesCliente, s.TaxaFinalMedia, s.Interrompido, vazao, lat, taxa)
++	page = strings.Replace(page, "Estas métricas não medem CPU, memória ou motivo interno de descarte do servidor.", "CPU, RAM residente e filas do broker são registradas separadamente quando -metricas é habilitado no broker. O arquivo filas-clientes.csv registra as filas locais e do gerador.", 1)
++	extra := fmt.Sprintf("<section><h2>Duplicatas</h2><p>Total: %d. Descartadas pela biblioteca antes de Eventos(): %d. Detectadas pelo gerador após Eventos(): %d. As etapas são somadas sem contar o mesmo recebimento duas vezes. O reconhecimento do cliente depende do cache recente; isso não mede duplicatas perdidas antes do cliente nem as rejeitadas pelo broker.</p></section>", s.Duplicadas, s.DuplicadasCliente, s.DuplicadasGerador)
++	page = strings.Replace(page, "</html>", extra+"</html>", 1)
+ 	return os.WriteFile(filepath.Join(dir, "relatorio.html"), []byte(page), 0644)
+ }
+ 
+diff --git a/internal/broker/filas.go b/internal/broker/filas.go
+new file mode 100644
+index 0000000..df1087b
+--- /dev/null
++++ b/internal/broker/filas.go
+@@ -0,0 +1,36 @@
++package broker
++
++import (
++	"sort"
++
++	"github.com/Luizalima3/middleware-pubsub-go/internal/fila"
++	"github.com/Luizalima3/middleware-pubsub-go/internal/metricas"
++)
++
++// Filas lê cada fila sob seu mutex. Não é uma transação entre todas as filas.
++// Controle guarda datagramas com tamanhos variados; bytes não são medidos ali.
++func (b *Broker) Filas() []metricas.Fila {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	out := []metricas.Fila{
++		{Tipo: "controle", Nome: "global", Estado: fila.Estado{Itens: len(b.controles), LimiteItens: cap(b.controles)}},
++		{Tipo: "par", Nome: "par", Estado: b.filaPar.Estado()},
++	}
++	for nome, t := range b.topicos {
++		out = append(out, metricas.Fila{Tipo: "topico", Nome: nome, Estado: t.fila.Estado()})
++	}
++	for endpoint, c := range b.clientes {
++		envio := 0
++		if c.emEnvio {
++			envio = 1
++		}
++		out = append(out, metricas.Fila{Tipo: "consumidor", Nome: c.id + "@" + endpoint, Estado: c.fila.Estado(), EmEnvio: envio})
++	}
++	sort.Slice(out, func(i, j int) bool {
++		if out[i].Tipo == out[j].Tipo {
++			return out[i].Nome < out[j].Nome
++		}
++		return out[i].Tipo < out[j].Tipo
++	})
++	return out
++}
+diff --git a/internal/fila/fila.go b/internal/fila/fila.go
+index d64087d..f38021f 100644
+--- a/internal/fila/fila.go
++++ b/internal/fila/fila.go
+@@ -11,6 +11,7 @@ type Fila[T any] struct {
+ 	mu                        sync.Mutex
+ 	itens                     []item[T]
+ 	bytes, maxItens, maxBytes int
++	picoItens, picoBytes      int
+ 	Sinal                     chan struct{}
+ }
+ 
+@@ -41,6 +42,12 @@ func (f *Fila[T]) Adicionar(v T, n int, descartarAntigos bool) ([]T, bool) {
+ 	}
+ 	f.itens = append(f.itens, item[T]{v, n})
+ 	f.bytes += n
++	if len(f.itens) > f.picoItens {
++		f.picoItens = len(f.itens)
++	}
++	if f.bytes > f.picoBytes {
++		f.picoBytes = f.bytes
++	}
+ 	select {
+ 	case f.Sinal <- struct{}{}:
+ 	default:
+@@ -65,6 +72,18 @@ func (f *Fila[T]) Tamanho() (int, int) {
+ 	defer f.mu.Unlock()
+ 	return len(f.itens), f.bytes
+ }
++
++// Estado é uma fotografia da fila. Picos são acumulados desde sua criação,
++// inclusive entre amostras, e não incluem itens já retirados para envio.
++type Estado struct {
++	Itens, Bytes, LimiteItens, LimiteBytes, PicoItens, PicoBytes int
++}
++
++func (f *Fila[T]) Estado() Estado {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return Estado{len(f.itens), f.bytes, f.maxItens, f.maxBytes, f.picoItens, f.picoBytes}
++}
+ func (f *Fila[T]) Limpar() { f.mu.Lock(); defer f.mu.Unlock(); f.itens = nil; f.bytes = 0 }
+ func (f *Fila[T]) Remover(se func(T) bool) {
+ 	f.mu.Lock()
+diff --git a/internal/fila/metricas_test.go b/internal/fila/metricas_test.go
+new file mode 100644
+index 0000000..b2eab9e
+--- /dev/null
++++ b/internal/fila/metricas_test.go
+@@ -0,0 +1,19 @@
++package fila
++
++import "testing"
++
++func TestPicosRegistramRajadaEntreAmostras(t *testing.T) {
++	f := Nova[string](3, 10)
++	f.Adicionar("a", 4, false)
++	f.Adicionar("b", 5, false)
++	f.Retirar()
++	f.Retirar()
++	s := f.Estado()
++	if s.Itens != 0 || s.Bytes != 0 || s.PicoItens != 2 || s.PicoBytes != 9 {
++		t.Fatal(s)
++	}
++	f.Limpar()
++	if f.Estado().PicoBytes != 9 {
++		t.Fatal("limpeza apagou pico histórico")
++	}
++}
+diff --git a/internal/metricas/coleta.go b/internal/metricas/coleta.go
+new file mode 100644
+index 0000000..61a406d
+--- /dev/null
++++ b/internal/metricas/coleta.go
+@@ -0,0 +1,126 @@
++package metricas
++
++import (
++	"context"
++	"encoding/csv"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strconv"
++	"time"
++
++	"github.com/Luizalima3/middleware-pubsub-go/internal/fila"
++)
++
++type Fila struct {
++	Tipo, Nome string
++	fila.Estado
++	EmEnvio int
++}
++
++type Coleta struct {
++	cancel context.CancelFunc
++	done   chan struct{}
++	err    error
++}
++
++// Iniciar não sobrescreve um experimento anterior. Flush por amostra preserva
++// amostras completas já escritas mesmo quando o processo é terminado à força.
++func Iniciar(ctx context.Context, arquivo string, intervalo time.Duration, filas func() []Fila) (*Coleta, error) {
++	if intervalo < 10*time.Millisecond || filas == nil {
++		return nil, errors.New("intervalo de métricas deve ser >= 10ms e snapshot obrigatório")
++	}
++	anterior, err := LerProcesso()
++	if err != nil {
++		return nil, err
++	}
++	if err = os.MkdirAll(filepath.Dir(arquivo), 0755); err != nil {
++		return nil, err
++	}
++	f, err := os.OpenFile(arquivo, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
++	if err != nil {
++		return nil, err
++	}
++	w := csv.NewWriter(f)
++	header := []string{"amostra", "instante", "pid", "cpu_total_s", "intervalo_s", "cpu_pct_1_nucleo", "cpu_pct_maquina", "cpus_logicas", "ram_residente_bytes", "goroutines", "fila_tipo", "fila_nome", "itens", "bytes", "limite_itens", "limite_bytes", "pico_itens", "pico_bytes", "em_envio"}
++	if err = w.Write(header); err == nil {
++		w.Flush()
++		err = w.Error()
++	}
++	if err != nil {
++		f.Close()
++		return nil, err
++	}
++	ctx, cancel := context.WithCancel(ctx)
++	c := &Coleta{cancel: cancel, done: make(chan struct{})}
++	go func() {
++		defer close(c.done)
++		defer func() {
++			if err := f.Close(); c.err == nil {
++				c.err = err
++			}
++		}()
++		prevTime := time.Now()
++		seq := 0
++		escrever := func(inicial bool) error {
++			p, e := LerProcesso()
++			if e != nil {
++				return e
++			}
++			now := time.Now()
++			dt := now.Sub(prevTime).Seconds()
++			cpu, normalizado := "", ""
++			if !inicial {
++				v := percentualCPU(anterior, p, dt)
++				cpu = fmt.Sprintf("%.6f", v)
++				normalizado = fmt.Sprintf("%.6f", v/float64(runtime.NumCPU()))
++			} else {
++				dt = 0
++			}
++			base := []string{strconv.Itoa(seq), now.Format(time.RFC3339Nano), strconv.Itoa(os.Getpid()), fmt.Sprintf("%.9f", p.CPUSegundos), fmt.Sprintf("%.9f", dt), cpu, normalizado, strconv.Itoa(runtime.NumCPU()), strconv.FormatUint(p.RAMBytes, 10), strconv.Itoa(runtime.NumGoroutine())}
++			for _, q := range filas() {
++				bytes, limiteBytes, picoItens, picoBytes := strconv.Itoa(q.Bytes), strconv.Itoa(q.LimiteBytes), strconv.Itoa(q.PicoItens), strconv.Itoa(q.PicoBytes)
++				if q.Tipo == "controle" {
++					bytes = ""
++					limiteBytes = ""
++					picoItens = ""
++					picoBytes = ""
++				}
++				row := append(append([]string(nil), base...), q.Tipo, q.Nome, strconv.Itoa(q.Itens), bytes, strconv.Itoa(q.LimiteItens), limiteBytes, picoItens, picoBytes, strconv.Itoa(q.EmEnvio))
++				if e = w.Write(row); e != nil {
++					return e
++				}
++			}
++			w.Flush()
++			anterior = p
++			prevTime = now
++			seq++
++			return w.Error()
++		}
++		if c.err = escrever(true); c.err != nil {
++			return
++		}
++		ticker := time.NewTicker(intervalo)
++		defer ticker.Stop()
++		for {
++			select {
++			case <-ctx.Done():
++				c.err = escrever(false)
++				return
++			case <-ticker.C:
++				if c.err = escrever(false); c.err != nil {
++					return
++				}
++			}
++		}
++	}()
++	return c, nil
++}
++
++// Fechar aguarda o último flush; pode ser chamado mais de uma vez.
++func (c *Coleta) Fechar() error { c.cancel(); <-c.done; return c.err }
++
++// Concluida permite ao executável perceber falhas de disco durante a coleta.
++func (c *Coleta) Concluida() <-chan struct{} { return c.done }
+diff --git a/internal/metricas/coleta_test.go b/internal/metricas/coleta_test.go
+new file mode 100644
+index 0000000..1be0193
+--- /dev/null
++++ b/internal/metricas/coleta_test.go
+@@ -0,0 +1,70 @@
++package metricas
++
++import (
++	"context"
++	"encoding/csv"
++	"os"
++	"path/filepath"
++	"strconv"
++	"testing"
++	"time"
++
++	"github.com/Luizalima3/middleware-pubsub-go/internal/fila"
++)
++
++func TestCPUUsaTempoDoProcessoESemLimitarAUmNucleo(t *testing.T) {
++	if v := percentualCPU(Processo{CPUSegundos: 4}, Processo{CPUSegundos: 5}, 2); v != 50 {
++		t.Fatal(v)
++	}
++	if v := percentualCPU(Processo{}, Processo{CPUSegundos: 3}, 2); v != 150 {
++		t.Fatal(v)
++	}
++	if v := percentualCPU(Processo{}, Processo{CPUSegundos: 3}, 0); v != 0 {
++		t.Fatal(v)
++	}
++}
++
++func TestColetaRecursosReaisECSVSemSobrescrever(t *testing.T) {
++	p, err := LerProcesso()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if p.RAMBytes == 0 {
++		t.Fatal("RAM não foi coletada")
++	}
++	path := filepath.Join(t.TempDir(), "metricas.csv")
++	c, err := Iniciar(context.Background(), path, 10*time.Millisecond, func() []Fila {
++		return []Fila{{Tipo: "topico", Nome: "a,b", Estado: fila.Estado{Itens: 2, Bytes: 10, LimiteItens: 4, LimiteBytes: 20, PicoItens: 3, PicoBytes: 15}}}
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	time.Sleep(35 * time.Millisecond)
++	if err = c.Fechar(); err != nil {
++		t.Fatal(err)
++	}
++	f, err := os.Open(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer f.Close()
++	rows, err := csv.NewReader(f).ReadAll()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(rows) < 3 || rows[1][5] != "" || rows[2][5] == "" {
++		t.Fatal(rows)
++	}
++	for _, row := range rows[1:] {
++		if row[11] != "a,b" || row[12] != "2" || row[14] != "4" || row[16] != "3" {
++			t.Fatal(row)
++		}
++		ram, e := strconv.ParseUint(row[8], 10, 64)
++		if e != nil || ram == 0 {
++			t.Fatal(row)
++		}
++	}
++	if _, err = Iniciar(context.Background(), path, time.Second, func() []Fila { return nil }); err == nil {
++		t.Fatal("sobrescreveu dados existentes")
++	}
++}
+diff --git a/internal/metricas/processo.go b/internal/metricas/processo.go
+new file mode 100644
+index 0000000..ef843f1
+--- /dev/null
++++ b/internal/metricas/processo.go
+@@ -0,0 +1,18 @@
++// Package metricas registra recursos do próprio processo e fotografias de filas.
++package metricas
++
++// Processo usa CPU acumulada de usuário + kernel e RAM residente atual.
++// RAM não é heap Go, memória virtual, pico histórico ou memória de toda a máquina.
++type Processo struct {
++	CPUSegundos float64
++	RAMBytes    uint64
++}
++
++func LerProcesso() (Processo, error) { return lerProcesso() }
++
++func percentualCPU(anterior, atual Processo, segundos float64) float64 {
++	if segundos <= 0 || atual.CPUSegundos < anterior.CPUSegundos {
++		return 0
++	}
++	return (atual.CPUSegundos - anterior.CPUSegundos) / segundos * 100
++}
+diff --git a/internal/metricas/processo_linux.go b/internal/metricas/processo_linux.go
+new file mode 100644
+index 0000000..be34a69
+--- /dev/null
++++ b/internal/metricas/processo_linux.go
+@@ -0,0 +1,32 @@
++//go:build linux
++
++package metricas
++
++import (
++	"fmt"
++	"os"
++	"strconv"
++	"strings"
++	"syscall"
++)
++
++func lerProcesso() (Processo, error) {
++	var r syscall.Rusage
++	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &r); err != nil {
++		return Processo{}, err
++	}
++	d, err := os.ReadFile("/proc/self/statm")
++	if err != nil {
++		return Processo{}, err
++	}
++	campos := strings.Fields(string(d))
++	if len(campos) < 2 {
++		return Processo{}, fmt.Errorf("statm inválido")
++	}
++	pages, err := strconv.ParseUint(campos[1], 10, 64)
++	if err != nil {
++		return Processo{}, err
++	}
++	cpu := float64(r.Utime.Sec+r.Stime.Sec) + float64(r.Utime.Usec+r.Stime.Usec)/1e6
++	return Processo{CPUSegundos: cpu, RAMBytes: pages * uint64(os.Getpagesize())}, nil
++}
+diff --git a/internal/metricas/processo_outros.go b/internal/metricas/processo_outros.go
+new file mode 100644
+index 0000000..bfa255b
+--- /dev/null
++++ b/internal/metricas/processo_outros.go
+@@ -0,0 +1,9 @@
++//go:build !windows && !linux
++
++package metricas
++
++import "errors"
++
++func lerProcesso() (Processo, error) {
++	return Processo{}, errors.New("coleta de CPU/RAM disponível apenas em Windows e Linux")
++}
+diff --git a/internal/metricas/processo_windows.go b/internal/metricas/processo_windows.go
+new file mode 100644
+index 0000000..4f26094
+--- /dev/null
++++ b/internal/metricas/processo_windows.go
+@@ -0,0 +1,40 @@
++//go:build windows
++
++package metricas
++
++import (
++	"fmt"
++	"syscall"
++	"unsafe"
++)
++
++var (
++	kernel32             = syscall.NewLazyDLL("kernel32.dll")
++	getCurrentProcess    = kernel32.NewProc("GetCurrentProcess")
++	getProcessTimes      = kernel32.NewProc("GetProcessTimes")
++	getProcessMemoryInfo = syscall.NewLazyDLL("psapi.dll").NewProc("GetProcessMemoryInfo")
++)
++
++// PROCESS_MEMORY_COUNTERS_EX: DWORDs seguidos de SIZE_Ts (32 ou 64 bits).
++type memoriaProcesso struct {
++	CB, FalhasPagina                                                                        uint32
++	PicoRAM, RAM, PicoPaged, Paged, PicoNonPaged, NonPaged, Pagefile, PicoPagefile, Private uintptr
++}
++
++func lerProcesso() (Processo, error) {
++	h, _, _ := getCurrentProcess.Call()
++	var criacao, saida, kernel, usuario syscall.Filetime
++	ok, _, err := getProcessTimes.Call(h, uintptr(unsafe.Pointer(&criacao)), uintptr(unsafe.Pointer(&saida)), uintptr(unsafe.Pointer(&kernel)), uintptr(unsafe.Pointer(&usuario)))
++	if ok == 0 {
++		return Processo{}, fmt.Errorf("GetProcessTimes: %w", err)
++	}
++	var m memoriaProcesso
++	m.CB = uint32(unsafe.Sizeof(m))
++	ok, _, err = getProcessMemoryInfo.Call(h, uintptr(unsafe.Pointer(&m)), uintptr(m.CB))
++	if ok == 0 {
++		return Processo{}, fmt.Errorf("GetProcessMemoryInfo: %w", err)
++	}
++	ticks := uint64(kernel.HighDateTime)<<32 | uint64(kernel.LowDateTime)
++	ticks += uint64(usuario.HighDateTime)<<32 | uint64(usuario.LowDateTime)
++	return Processo{CPUSegundos: float64(ticks) / 1e7, RAMBytes: uint64(m.RAM)}, nil
++}
+diff --git a/scripts/comparar.py b/scripts/comparar.py
+new file mode 100644
+index 0000000..687ce1f
+--- /dev/null
++++ b/scripts/comparar.py
+@@ -0,0 +1,237 @@
++"""Analisa CSVs e gera comparação das repetições, sem substituir dados brutos."""
++import argparse
++import base64
++import csv
++import html
++import json
++import statistics
++from collections import defaultdict
++from datetime import datetime
++from pathlib import Path
++
++import matplotlib
++matplotlib.use("Agg")
++import matplotlib.pyplot as plt
++
++
++def instante(value):
++    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
++
++
++def ler_csv(path):
++    with path.open(encoding="utf-8", newline="") as f:
++        rows = list(csv.DictReader(f))
++    valid = [r for r in rows if None not in r and all(v is not None for v in r.values())]
++    return valid, len(rows)-len(valid)
++
++
++def analisar(root, run):
++    path = root/run["pasta"]
++    s = json.loads((path/"resumo.json").read_text(encoding="utf-8"))
++    start = instante(s["inicio"])
++    duration = s["janela_observada_segundos"]
++    end = start+duration
++    cpu_s, ram_peaks, filas_peak, locais_peak = 0., [], defaultdict(float), 0.
++    detalhes, series = [], []
++    incompletas = 0
++    for file in sorted(path.glob("broker-*.csv")):
++        rows, bad = ler_csv(file)
++        incompletas += bad
++        # Recursos aparecem repetidos em cada fila; cada amostra só conta uma vez.
++        samples = {r["amostra"]: r for r in rows}
++        inside = [r for r in samples.values() if start <= instante(r["instante"]) <= end]
++        covered = [r for r in inside if r["cpu_pct_1_nucleo"] and
++                   instante(r["instante"])-float(r["intervalo_s"]) >= start]
++        if len(inside) < 2 or not covered:
++            raise ValueError("Coleta de recursos insuficiente: "+str(file))
++        seconds = sum(float(r["intervalo_s"]) for r in covered)
++        cpu = sum(float(r["cpu_pct_1_nucleo"])*float(r["intervalo_s"])/100 for r in covered)
++        memory = max(int(r["ram_residente_bytes"]) for r in inside)
++        if memory <= 0:
++            raise ValueError("RAM residente não coletada")
++        cpu_s += cpu
++        ram_peaks.append(memory/1024**2)
++        detalhes.append({"broker": file.stem, "cpu_segundos_cobertos": cpu,
++                         "segundos_cobertos": seconds, "cobertura_janela_pct": seconds/duration*100,
++                         "cpu_media_periodo_ativo_pct_1_nucleo": cpu/seconds*100,
++                         "ram_residente_pico_mib": memory/1024**2})
++        for r in rows:
++            if not start <= instante(r["instante"]) <= end:
++                continue
++            cap, count = int(r["limite_itens"]), int(r["itens"])
++            if count < 0 or count > cap:
++                raise ValueError("Fila excedeu o limite: "+str(file))
++            if r["limite_bytes"] and int(r["bytes"]) > int(r["limite_bytes"]):
++                raise ValueError("Fila excedeu o limite de bytes: "+str(file))
++            if cap:
++                # Picos são registrados em cada inserção, mesmo entre amostras.
++                value = int(r["pico_itens"]) if r["pico_itens"] else count
++                filas_peak[r["fila_tipo"]] = max(filas_peak[r["fila_tipo"]], value/cap*100)
++        series.append((file.stem, inside, rows))
++    local, bad = ler_csv(path/"filas-clientes.csv")
++    incompletas += bad
++    for r in local:
++        cap, count = int(r["limite_itens"]), int(r["itens"])
++        if count < 0 or count > cap:
++            raise ValueError("Fila local excedeu a capacidade")
++        if r["papel"] == "assinante" and r["fila"] == "dados" and cap:
++            locais_peak = max(locais_peak, count/cap*100)
++    expected = s["publicacoes_escritas_no_socket"]*s["configuracao"]["assinantes"]
++    result = {"cenario": run["cenario"], "repeticao": run["repeticao"],
++              "configuracao_sha256": run["configuracao_sha256"],
++              "publicacoes": s["publicacoes_escritas_no_socket"], "entregas": s["entregas_unicas"],
++              "ausentes": s["entregas_ausentes_entre_envios_sem_erro"],
++              "ausentes_pct": 100*s["entregas_ausentes_entre_envios_sem_erro"]/expected if expected else 0.,
++              "entregas_s": s["entregas_por_segundo_observado"],
++              "p99_ms": s["p99_ms"], "p99_normais_ms": s["p99_assinantes_normais_ms"],
++              "p99_lentos_ms": s["p99_assinantes_lentos_ms"],
++              "cpu_pct_1_nucleo": cpu_s/duration*100,
++              "cpu_segundos_cobertos": cpu_s, "ram_picos_soma_mib": sum(ram_peaks),
++              "fila_consumidor_pico_pct": filas_peak["consumidor"],
++              "fila_topico_pico_pct": filas_peak["topico"],
++              "fila_cliente_max_amostrado_pct": locais_peak,
++              "descartes_cliente": s["descartes_fila_cliente"],
++              "descartes_broker_avisados": s["avisos_descartes_broker"],
++              "duplicatas_cliente": s["duplicatas_descartadas_pelo_cliente"],
++              "duplicatas_gerador": s["duplicatas_detectadas_pelo_gerador"],
++              "duplicatas_total": s["entregas_duplicadas"],
++              "avisos_rate_limit": s["avisos_rate_limit"],
++              "puladas": s["publicacoes_puladas_pelo_gerador"],
++              "linhas_csv_incompletas": incompletas, "brokers": detalhes}
++    if result["duplicatas_total"] != result["duplicatas_cliente"]+result["duplicatas_gerador"]:
++        raise ValueError("Contagem de duplicatas inconsistente")
++    return result, (s, start, end, series, local)
++
++
++def grafico_series(root, run, data):
++    s, start, end, series, local = data
++    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True, constrained_layout=True)
++    for name, samples, rows in series:
++        cpu = [r for r in samples if r["cpu_pct_1_nucleo"]]
++        axes[0].plot([instante(r["instante"])-start for r in cpu],
++                     [float(r["cpu_pct_1_nucleo"]) for r in cpu], label=name)
++        axes[1].plot([instante(r["instante"])-start for r in samples],
++                     [int(r["ram_residente_bytes"])/1024**2 for r in samples], label=name)
++        queues = defaultdict(lambda: defaultdict(float))
++        for r in rows:
++            t = instante(r["instante"])
++            cap = int(r["limite_itens"])
++            if start <= t <= end and cap and r["fila_tipo"] in ("topico", "consumidor"):
++                queues[r["fila_tipo"]][t] = max(queues[r["fila_tipo"]][t], int(r["itens"])/cap*100)
++        for kind, values in queues.items():
++            axes[2].plot([t-start for t in values], list(values.values()), label=name+" "+kind)
++    dados = defaultdict(float)
++    for r in local:
++        if r["fila"] == "dados" and r["papel"] == "assinante" and int(r["limite_itens"]):
++            t = float(r["segundos"])
++            dados[t] = max(dados[t], int(r["itens"])/int(r["limite_itens"])*100)
++    axes[2].plot(list(dados), list(dados.values()), "--", label="máximo nas filas locais de dados")
++    labels = ["CPU (% de um núcleo)", "RAM residente (MiB)", "Ocupação amostrada (%)"]
++    for ax, label in zip(axes, labels):
++        ax.set_ylabel(label); ax.grid(alpha=.25); ax.legend(fontsize=8, loc="upper right")
++        ax.set_ylim(bottom=0)
++    axes[2].set_ylim(0, 105)
++    axes[2].set_xlabel("Segundos desde o início da carga (inclui drenagem)")
++    axes[2].set_xlim(0, end-start)
++    publication_end = s["configuracao"]["duracao_ns"]/1e9
++    for ax in axes:
++        ax.axvline(publication_end, color="grey", linestyle=":", alpha=.6)
++        if run.get("evento_falha"):
++            ax.axvline(instante(run["evento_falha"]["instante"])-start, color="#b91c1c", linestyle="--", alpha=.7)
++    fig.suptitle(f"{run['cenario']} — repetição {run['repeticao']}\nPontilhado: fim dos envios; vermelho: término do broker, quando aplicável")
++    name = f"series-{run['cenario']}-{run['repeticao']:02}.png"
++    fig.savefig(root/name, dpi=150); plt.close(fig)
++    return name
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--entrada", type=Path, required=True)
++    args = ap.parse_args()
++    root = args.entrada.resolve()
++    manifest = json.loads((root/"manifesto.json").read_text(encoding="utf-8"))
++    cfg = json.loads((root/"configuracao.json").read_text(encoding="utf-8"))
++    grouped = defaultdict(list)
++    records, charts = [], {}
++    if len(manifest["execucoes"]) != len(manifest["plano"]):
++        raise ValueError("Experimento incompleto; não gerar comparação como se estivesse concluído")
++    for run in manifest["execucoes"]:
++        if not run["sucesso"]:
++            raise ValueError("Há execução sem sucesso")
++        r, data = analisar(root, run)
++        records.append(r); grouped[r["cenario"]].append(r)
++        charts[(run["cenario"], run["repeticao"])] = grafico_series(root, run, data)
++    names = [c["nome"] for c in cfg["cenarios"]]
++    for name in names:
++        rows = grouped[name]
++        if len(rows) != cfg["repeticoes"] or len({r["configuracao_sha256"] for r in rows}) != 1:
++            raise ValueError("Repetições com configuração diferente ou faltando: "+name)
++    flat = [{k: v for k, v in r.items() if k != "brokers"} for r in records]
++    with (root/"comparativo.csv").open("w", newline="", encoding="utf-8") as f:
++        w = csv.DictWriter(f, fieldnames=list(flat[0])); w.writeheader(); w.writerows(flat)
++    (root/"comparativo.json").write_text(json.dumps(records, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
++    metrics = [("cpu_pct_1_nucleo", "CPU total registrada / janela", "% de um núcleo; cobertura parcial"),
++               ("ram_picos_soma_mib", "Soma dos picos residentes dos brokers", "MiB; picos não necessariamente simultâneos"),
++               ("fila_consumidor_pico_pct", "Maior pico de uma fila de consumidor", "% da capacidade em itens"),
++               ("p99_normais_ms", "Latência p99 dos assinantes normais", "ms; mediana dos p99 por execução"),
++               ("entregas_s", "Vazão de entregas únicas", "entregas/s; inclui drenagem"),
++               ("ausentes_pct", "Entregas ausentes", "% dos pares publicação/assinante")]
++    fig, axes = plt.subplots(2, 3, figsize=(15, 9), constrained_layout=True)
++    for ax, (key, title, unit) in zip(axes.flat, metrics):
++        values = [[r[key] for r in grouped[name]] for name in names]
++        medians = [statistics.median(v) for v in values]
++        ax.bar(range(len(names)), medians, color=["#147d92", "#d7882b", "#b95757", "#7763a3", "#526881"])
++        ax.errorbar(range(len(names)), medians,
++                    yerr=[[m-min(v) for m, v in zip(medians, values)],
++                          [max(v)-m for m, v in zip(medians, values)]], fmt="none", ecolor="#263238", capsize=4)
++        ax.set_xticks(range(len(names)), names, rotation=20)
++        ax.set_title(title, fontsize=11); ax.set_ylabel(unit, fontsize=9)
++        ax.set_ylim(bottom=0); ax.grid(axis="y", alpha=.2)
++    fig.suptitle(f"Comparação descritiva — {cfg['repeticoes']} repetições por cenário\nBarras: mediana; hastes: mínimo–máximo (não são intervalos de confiança). Cargas diferentes entre cenários.")
++    fig.savefig(root/"comparativo.png", dpi=160)
++    fig.savefig(root/"comparativo.svg"); plt.close(fig)
++    def faixa(name, key):
++        v = [r[key] for r in grouped[name]]
++        return f"{statistics.median(v):.2f} [{min(v):.2f}–{max(v):.2f}]"
++    text = ["# Resultados dos experimentos", "",
++            f"Foram concluídas {len(records)} execuções: {cfg['repeticoes']} por cenário. Mesma configuração dentro de cada cenário; processos novos em cada repetição. Ordem alternada com semente registrada.", "",
++            "## Como interpretar", "",
++            "CPU usa o tempo de usuário + kernel do próprio broker. 100% corresponde a um núcleo lógico; pode ultrapassar 100%. A soma do tempo de CPU dos intervalos inteiros cobertos é dividida pela janela do experimento. Os intervalos de borda não são extrapolados: a cobertura exata de cada broker está em comparativo.json. Na falha, a coleta do broker terminado acaba antes da janela.", "",
++            "RAM é o conjunto residente (working set no Windows), não o heap Go. A comparação soma o maior valor amostrado de cada broker; esses picos podem ocorrer em instantes diferentes e páginas compartilhadas podem ser contadas em ambos. Não é a RAM física exclusiva da máquina.", "",
++            "As filas do broker registram ocupação atual e picos desde sua criação, por quantidade e bytes. Os picos das filas de dados são atualizados a cada inserção, inclusive entre amostras; controle tem apenas ocupação amostrada em itens. Filas locais e do gerador são amostradas, podendo perder picos rápidos. Um item já retirado para envio não está na ocupação; em_envio é registrado à parte.", "",
++            "As cargas e durações diferem entre cenários. Esta é uma comparação descritiva, não um teste que isola o efeito do algoritmo. Os p99 são calculados por execução: a mediana desses percentis não é o p99 de todas as mensagens reunidas. As hastes mostram variação entre repetições, não significância estatística.", "",
++            "## Comparação (mediana [mínimo–máximo])", "",
++            "| Cenário | CPU registrada/janela (%) | RAM, soma picos (MiB) | Pico fila consumidor (%) | p99 normais (ms) | Ausentes (%) |",
++            "| --- | --- | --- | --- | --- | --- |"]
++    for name in names:
++        text.append("| "+name+" | "+" | ".join(faixa(name, k) for k in ["cpu_pct_1_nucleo", "ram_picos_soma_mib", "fila_consumidor_pico_pct", "p99_normais_ms", "ausentes_pct"])+" |")
++    text += ["", "## O que foi observado", ""]
++    for name in names:
++        rows = grouped[name]
++        text.append(f"- **{name}:** entregas únicas {faixa(name, 'entregas')}; ausentes {faixa(name, 'ausentes_pct')}%; p99 dos consumidores normais {faixa(name, 'p99_normais_ms')} ms. Maior pico de fila de consumidor: {max(r['fila_consumidor_pico_pct'] for r in rows):.1f}%.")
++    text += ["", "O cenário lento inclui atraso artificial e filas menores no cliente. Seu p99 geral mistura consumidores lentos e normais; por isso a comparação usa também o p99 separado dos normais. Ausências, avisos de rejeição e descartes podem se sobrepor e não devem ser somados como causas independentes.", "",
++             "O cenário de excesso ignora deliberadamente o controle local para verificar a proteção do broker. A redução da taxa informada nesse caso não significa que o cliente agressivo a respeitou. Os dois brokers geram custo agregado de dois processos; não compare essa soma como se fosse o consumo de apenas um processo.", "",
++             "Na falha, o primeiro broker é terminado dois segundos após lançar o processo do gerador, não após o início exato das publicações. O instante real do evento está em execucao.json e nos gráficos. O teste verifica retomada no sobrevivente; não mede automaticamente o tempo exato de indisponibilidade.", "",
++             "## Duplicatas", "",
++             f"As {len(records)} execuções registraram {sum(r['duplicatas_cliente'] for r in records)} duplicatas filtradas pela biblioteca e {sum(r['duplicatas_gerador'] for r in records)} detectadas pelo gerador. O total é a soma das etapas: uma mensagem removida antes de Eventos() não é contada novamente pelo gerador.", "",
++             "Há um teste de injeção controlada que envia três cópias de cada entrega e verifica três entregas únicas e seis duplicatas filtradas para três publicações. Esse teste demonstra a contabilização; não é evidência de duplicação espontânea na rede. Zero duplicatas observadas não prova ausência fora da janela/cache nem mede as eliminadas pelo broker.", "",
++             "## Limites e reprodução", "",
++             "Resultados locais curtos, com instrumentação habilitada em todas as execuções. Não foi quantificado o custo adicional da coleta. Não há promessa de capacidade de produção nem conclusão sobre outras redes ou equipamentos. Aumente duração e repetições para a apresentação, usando uma nova pasta para cada lote.", "",
++             "configuracao.json guarda parâmetros; manifesto.json registra ambiente, ordem, versão Go, revisão base, patch e hashes dos binários. Cada repetição contém CSVs, logs, resumo, contadores finais e comandos completos. comparativo.csv tem uma linha por execução; comparativo.json inclui a cobertura de CPU por broker. As séries usam tempo relativo ao início da carga e incluem a drenagem.", ""]
++    analysis = "\n".join(text)
++    (root/"ANALISE.md").write_text(analysis, encoding="utf-8")
++    encoded = base64.b64encode((root/"comparativo.png").read_bytes()).decode()
++    # Texto e tabela também disponíveis sem depender de um renderizador Markdown.
++    page = '<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Resultados Pub/Sub</title><style>body{font:16px/1.65 system-ui;max-width:1150px;margin:32px auto;padding:0 20px;color:#213448}img{max-width:100%}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f4f7fb;padding:20px;border-radius:10px}a{color:#126779}</style><h1>CPU, memória, filas e desempenho</h1>'
++    page += '<img alt="Comparação das repetições" src="data:image/png;base64,'+encoded+'">'
++    page += '<p><a href="comparativo.csv">CSV comparativo</a> · <a href="comparativo.json">Detalhes por broker</a> · <a href="configuracao.json">Configuração</a></p><pre>'+html.escape(analysis)+'</pre><h2>Séries da primeira repetição</h2>'
++    for name in names:
++        image = charts[(name, 1)]
++        page += '<h3>'+html.escape(name)+'</h3><img alt="Série '+html.escape(name)+'" src="'+image+'">'
++    page += '</html>'
++    (root/"relatorio-comparativo.html").write_text(page, encoding="utf-8")
++    print("Comparação concluída:", root/"relatorio-comparativo.html", flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/experimentos.py b/scripts/experimentos.py
+new file mode 100644
+index 0000000..be1232c
+--- /dev/null
++++ b/scripts/experimentos.py
+@@ -0,0 +1,211 @@
++"""Repete configurações registradas, com processos novos e coleta no broker.
++
++Usa apenas a biblioteca padrão. O relatório opcional usa matplotlib.
++"""
++import argparse
++import hashlib
++import json
++import os
++import platform
++import random
++import socket
++import subprocess
++import sys
++import time
++from datetime import datetime, timezone
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++HIDDEN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
++
++
++def agora():
++    return datetime.now(timezone.utc).isoformat()
++
++
++def gravar(path, value):
++    path.write_text(json.dumps(value, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
++
++
++def sha(path):
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def porta():
++    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
++        s.bind(("127.0.0.1", 0))
++        return s.getsockname()[1]
++
++
++def flags(values):
++    args = []
++    for key, value in values.items():
++        if isinstance(value, bool):
++            args.append(f"-{key}={'true' if value else 'false'}")
++        else:
++            args += ["-"+key, str(value)]
++    return args
++
++
++def estatisticas(endereco):
++    host, port = endereco.rsplit(":", 1)
++    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
++        s.settimeout(.5)
++        # Consulta ao fim da observação, sem poluir a coleta com polling UDP.
++        msg = json.dumps({"tipo": "ESTATISTICAS", "id": 7, "cliente": "avaliacao-final"}).encode()
++        for _ in range(3):
++            s.sendto(msg, (host, int(port)))
++            try:
++                while True:
++                    data, source = s.recvfrom(1001)
++                    if source != (host, int(port)):
++                        continue
++                    m = json.loads(data)
++                    if m.get("tipo") == "OK" and m.get("id") == 7:
++                        return json.loads(m["conteudo"])
++            except socket.timeout:
++                pass
++    raise RuntimeError("Sem estatísticas de "+endereco)
++
++
++def executar(case, rep, cfg, out, bin_dir):
++    nome = case["nome"]
++    dest = out / nome / f"repeticao-{rep:02}"
++    dest.mkdir(parents=True, exist_ok=False)
++    servidores, handles, carga = [], [], None
++    enderecos = [f"127.0.0.1:{porta()}" for _ in range(case["brokers"])]
++    if len(set(enderecos)) != len(enderecos):
++        raise RuntimeError("Portas repetidas; execute novamente em outra pasta")
++    broker_cfg = cfg["broker_comum"] | case.get("broker", {})
++    carga_cfg = cfg["carga_comum"] | case["carga"]
++    registro = {"cenario": nome, "repeticao": rep, "pasta": str(dest.relative_to(out)),
++                "inicio_processo_carga": None, "evento_falha": None,
++                "configuracao_broker": broker_cfg, "configuracao_carga": carga_cfg,
++                "comandos_brokers": [], "comando_carga": [], "sucesso": False}
++    # Este fingerprint ignora portas/IDs efêmeros e identifica a carga repetida.
++    fixed = {"broker": broker_cfg, "carga": carga_cfg, "brokers": case["brokers"],
++             "intervalo_metricas": cfg["intervalo_metricas"],
++             "aquecimento": cfg["aquecimento_segundos"],
++             "falha_apos": case.get("encerrar_primeiro_apos_segundos")}
++    registro["configuracao_sha256"] = hashlib.sha256(json.dumps(fixed, sort_keys=True).encode()).hexdigest()
++    try:
++        for i, endereco in enumerate(enderecos):
++            args = [str(bin_dir / executable("broker")), "-endereco", endereco,
++                    "-id", f"b{i+1}", "-metricas", str(dest/f"broker-{i+1}.csv"),
++                    "-intervalo-metricas", cfg["intervalo_metricas"]] + flags(broker_cfg)
++            if len(enderecos) == 2:
++                args += ["-par", enderecos[1-i]]
++            log = (dest/f"broker-{i+1}.log").open("w", encoding="utf-8")
++            handles.append(log)
++            servidores.append(subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT,
++                                               creationflags=HIDDEN))
++            registro["comandos_brokers"].append(args)
++        time.sleep(cfg["aquecimento_segundos"])
++        if any(p.poll() is not None for p in servidores):
++            raise RuntimeError("Broker encerrou na inicialização; veja os logs")
++        args = [str(bin_dir / executable("carga")), "-brokers", ",".join(enderecos),
++                "-topico", f"avaliacao/{nome}/{rep}", "-saida", str(dest),
++                "-intervalo-metricas", cfg["intervalo_metricas"]] + flags(carga_cfg)
++        registro["comando_carga"] = args
++        registro["inicio_processo_carga"] = agora()
++        with (dest/"carga.log").open("w", encoding="utf-8") as log:
++            carga = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, creationflags=HIDDEN)
++            queda = case.get("encerrar_primeiro_apos_segundos")
++            if queda is not None:
++                time.sleep(queda)
++                registro["evento_falha"] = {"instante": agora(), "broker": 1,
++                                            "referencia": "após iniciar o processo do gerador"}
++                servidores[0].terminate()
++                servidores[0].wait(timeout=5)
++            code = carga.wait(timeout=45)
++        if code:
++            raise RuntimeError("Gerador falhou: "+(dest/"carga.log").read_text(encoding="utf-8"))
++        resumo = json.loads((dest/"resumo.json").read_text(encoding="utf-8"))
++        counters = [{"broker": i+1, "estatisticas": estatisticas(a)}
++                    for i, (a, p) in enumerate(zip(enderecos, servidores)) if p.poll() is None]
++        gravar(dest/"brokers-final.json", counters)
++        if resumo["entregas_unicas"] <= 0 or resumo["publicacoes_escritas_no_socket"] <= 0:
++            raise RuntimeError("Não houve comunicação útil")
++        if nome == "excesso" and not any(c["estatisticas"]["rejeitadas"] for c in counters):
++            raise RuntimeError("Cenário não exercitou o teto do broker")
++        if nome == "lento" and resumo["descartes_fila_cliente"] + sum(c["estatisticas"]["descartadas"] for c in counters) == 0:
++            raise RuntimeError("Cenário não exercitou descarte")
++        if nome == "dois-brokers" and not any(c["estatisticas"]["repasses"] for c in counters):
++            raise RuntimeError("Cenário não exercitou repasse")
++        if queda is not None and (len(counters) != 1 or counters[0]["estatisticas"]["aceitas"] == 0):
++            raise RuntimeError("Não retomou publicações no sobrevivente")
++        registro["sucesso"] = True
++        registro["fim"] = agora()
++        print(f"OK {nome} #{rep}: {resumo['entregas_unicas']} entregas; "
++              f"{resumo['entregas_ausentes_entre_envios_sem_erro']} ausentes", flush=True)
++        return registro
++    finally:
++        if carga is not None and carga.poll() is None:
++            carga.terminate(); carga.wait(timeout=5)
++        for p in servidores:
++            if p.poll() is None:
++                p.terminate(); p.wait(timeout=5)
++        for log in handles:
++            log.close()
++        gravar(dest/"execucao.json", registro)
++
++
++def executable(name):
++    return name+(".exe" if os.name == "nt" else "")
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--config", type=Path, default=ROOT/"experimentos/configuracao.json")
++    ap.add_argument("--saida", type=Path, required=True)
++    ap.add_argument("--go", default="go")
++    ap.add_argument("--bin-dir", type=Path, default=ROOT/"bin")
++    ap.add_argument("--sem-testes", action="store_true", help="usar apenas após verificar a mesma revisão")
++    ap.add_argument("--sem-graficos", action="store_true")
++    args = ap.parse_args()
++    cfg = json.loads(args.config.read_text(encoding="utf-8"))
++    if not 1 <= cfg["repeticoes"] <= 20:
++        raise ValueError("repeticoes deve estar entre 1 e 20")
++    out, bin_dir = args.saida.resolve(), args.bin_dir.resolve()
++    out.mkdir(parents=True, exist_ok=False)
++    bin_dir.mkdir(parents=True, exist_ok=True)
++    gravar(out/"configuracao.json", cfg)
++    versao = subprocess.check_output([args.go, "version"], cwd=ROOT, text=True).strip()
++    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
++    patch = subprocess.check_output(["git", "diff", "HEAD", "--binary"], cwd=ROOT)
++    (out/"fonte.patch").write_bytes(patch)
++    with (out/"verificacao.log").open("w", encoding="utf-8") as log:
++        if not args.sem_testes:
++            subprocess.run([args.go, "test", "./...", "-count=1"], cwd=ROOT, stdout=log,
++                           stderr=subprocess.STDOUT, check=True)
++        for cmd in ("broker", "carga"):
++            subprocess.run([args.go, "build", "-o", str(bin_dir/executable(cmd)), "./cmd/"+cmd],
++                           cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, check=True)
++    plano = []
++    rng = random.Random(cfg["semente_ordem"])
++    for rep in range(1, cfg["repeticoes"]+1):
++        rodada = list(cfg["cenarios"])
++        rng.shuffle(rodada)
++        plano.extend((c, rep) for c in rodada)
++    manifesto = {"inicio": agora(), "sistema": platform.platform(), "arquitetura": platform.machine(),
++                 "cpu": platform.processor(), "cpus_logicas": os.cpu_count(), "go": versao,
++                 "base_commit": base, "fonte_patch_sha256": sha(out/"fonte.patch"),
++                 "configuracao_sha256": sha(out/"configuracao.json"), "testes_executados": not args.sem_testes,
++                 "sha256_scripts": {name: sha(ROOT/"scripts"/name) for name in ("experimentos.py", "comparar.py")},
++                 "sha256_binarios": {cmd: sha(bin_dir/executable(cmd)) for cmd in ("broker", "carga")},
++                 "plano": [{"cenario": c["nome"], "repeticao": r} for c, r in plano], "execucoes": []}
++    gravar(out/"manifesto.json", manifesto)
++    for i, (case, rep) in enumerate(plano):
++        print(f"[{i+1}/{len(plano)}] {case['nome']} repetição {rep}", flush=True)
++        manifesto["execucoes"].append(executar(case, rep, cfg, out, bin_dir))
++        gravar(out/"manifesto.json", manifesto)
++    manifesto["fim"] = agora()
++    gravar(out/"manifesto.json", manifesto)
++    if not args.sem_graficos:
++        subprocess.run([sys.executable, str(ROOT/"scripts/comparar.py"), "--entrada", str(out)],
++                       cwd=ROOT, check=True)
++    print("Resultados:", out, flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/requirements.txt b/scripts/requirements.txt
+new file mode 100644
+index 0000000..fc62216
+--- /dev/null
++++ b/scripts/requirements.txt
+@@ -0,0 +1 @@
++matplotlib>=3.8,<4

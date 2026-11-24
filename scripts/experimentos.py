@@ -78,7 +78,7 @@ def executar(case, rep, cfg, out, bin_dir):
         raise RuntimeError("Portas repetidas; execute novamente em outra pasta")
     broker_cfg = cfg["broker_comum"] | case.get("broker", {})
     carga_cfg = cfg["carga_comum"] | case["carga"]
-    registro = {"cenario": nome, "repeticao": rep, "pasta": str(dest.relative_to(out)),
+    registro = {"cenario": nome, "repeticao": rep, "pasta": dest.relative_to(out).as_posix(),
                 "inicio_processo_carga": None, "evento_falha": None,
                 "configuracao_broker": broker_cfg, "configuracao_carga": carga_cfg,
                 "comandos_brokers": [], "comando_carga": [], "sucesso": False}

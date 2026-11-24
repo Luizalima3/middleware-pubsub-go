@@ -1,0 +1,17 @@
+{
+  "execucoes": 15,
+  "repeticoes_por_cenario": {
+    "lento": 3,
+    "falha": 3,
+    "dois-brokers": 3,
+    "excesso": 3,
+    "normal": 3
+  },
+  "amostras_recursos": 578,
+  "csv_completos": true,
+  "formulas_cpu_verificadas": true,
+  "limites_filas_verificados": true,
+  "configuracoes_repetidas_iguais": true,
+  "graficos_svg_validos": true,
+  "links_html_validos": true
+}

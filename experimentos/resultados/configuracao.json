@@ -1,0 +1,90 @@
+{
+  "repeticoes": 3,
+  "semente_ordem": 2026,
+  "aquecimento_segundos": 0.5,
+  "intervalo_metricas": "200ms",
+  "carga_comum": {
+    "payload": 128,
+    "fila": 64,
+    "drenagem": "1s",
+    "timeout": "5s",
+    "buffer-cliente": 32
+  },
+  "broker_comum": {
+    "teto-cliente": 500,
+    "teto-entrada": 1000,
+    "teto-saida": 3000,
+    "teto-controle": 500,
+    "teto-par": 1000,
+    "rajada": 8,
+    "intervalo": "250ms",
+    "inatividade": "5s",
+    "fila-topico": 128,
+    "fila-cliente": 64,
+    "bytes-topico": 128000,
+    "bytes-cliente": 64000,
+    "max-clientes": 256,
+    "max-topicos": 128
+  },
+  "cenarios": [
+    {
+      "nome": "normal",
+      "brokers": 1,
+      "carga": {
+        "publicadores": 2,
+        "assinantes": 3,
+        "taxa": 15,
+        "duracao": "3s"
+      }
+    },
+    {
+      "nome": "lento",
+      "brokers": 1,
+      "carga": {
+        "publicadores": 2,
+        "assinantes": 2,
+        "taxa": 60,
+        "duracao": "5s",
+        "lentos": 1,
+        "atraso-lento": "100ms",
+        "buffer-cliente": 2
+      }
+    },
+    {
+      "nome": "excesso",
+      "brokers": 1,
+      "broker": {
+        "teto-cliente": 30
+      },
+      "carga": {
+        "publicadores": 1,
+        "assinantes": 2,
+        "taxa": 300,
+        "duracao": "3s",
+        "ignorar-controle": true
+      }
+    },
+    {
+      "nome": "dois-brokers",
+      "brokers": 2,
+      "carga": {
+        "publicadores": 1,
+        "assinantes": 3,
+        "taxa": 20,
+        "duracao": "3s",
+        "distribuir": true
+      }
+    },
+    {
+      "nome": "falha",
+      "brokers": 2,
+      "encerrar_primeiro_apos_segundos": 2,
+      "carga": {
+        "publicadores": 1,
+        "assinantes": 2,
+        "taxa": 20,
+        "duracao": "8s"
+      }
+    }
+  ]
+}

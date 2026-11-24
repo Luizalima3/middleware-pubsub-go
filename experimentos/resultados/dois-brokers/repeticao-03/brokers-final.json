@@ -1,0 +1,44 @@
+[
+  {
+    "broker": 1,
+    "estatisticas": {
+      "interesses_remotos": 1,
+      "pendencias_controle": 0,
+      "recebidas": 60,
+      "aceitas": 60,
+      "rejeitadas": 0,
+      "entregas_enviadas": 60,
+      "descartadas": 0,
+      "invalidas": 0,
+      "controle_sem_confirmacao": 0,
+      "duplicadas": 0,
+      "repasses": 60,
+      "bytes_enviados": 35478,
+      "clientes": 4,
+      "topicos": 1,
+      "fila_entrada": 0,
+      "fila_saida": 0
+    }
+  },
+  {
+    "broker": 2,
+    "estatisticas": {
+      "interesses_remotos": 1,
+      "pendencias_controle": 0,
+      "recebidas": 0,
+      "aceitas": 0,
+      "rejeitadas": 0,
+      "entregas_enviadas": 120,
+      "descartadas": 0,
+      "invalidas": 0,
+      "controle_sem_confirmacao": 0,
+      "duplicadas": 0,
+      "repasses": 0,
+      "bytes_enviados": 35330,
+      "clientes": 3,
+      "topicos": 1,
+      "fila_entrada": 0,
+      "fila_saida": 0
+    }
+  }
+]

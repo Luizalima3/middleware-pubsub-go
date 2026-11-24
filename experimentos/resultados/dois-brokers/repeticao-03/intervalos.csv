@@ -1,0 +1,7 @@
+segundo,oferecidas,enviadas_socket,puladas_gerador,erros_envio,entregas_unicas,avisos_rate_limit,avisos_sem_inscritos,p99_ms,taxa_media_cliente,amostras_taxa
+0,20,20,0,0,60,0,0,11.965790,20.000000,20
+1,20,20,0,0,60,0,0,23.001017,20.000000,20
+2,20,20,0,0,60,0,0,34.861867,20.000000,20
+3,0,0,0,0,0,0,0,0.000000,0.000000,0
+4,0,0,0,0,0,0,0,0.000000,0.000000,0
+5,0,0,0,0,0,0,0,0.000000,0.000000,0

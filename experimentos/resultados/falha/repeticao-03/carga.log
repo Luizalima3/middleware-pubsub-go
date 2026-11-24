@@ -1,0 +1,3 @@
+Preparando clientes: o broker precisa confirmar criação e inscrições com TipoOK.
+Escritas: 81 | entregas únicas: 90 | ausentes: 72 | puladas: 78 | p99: 3883.216 ms
+Relatório: C:\Users\junio\Documents\Codex\2026-10-26\c-users-junio-documents-codex-2026\outputs\experimentos-recursos-2026-11-23-final\falha\repeticao-03/relatorio.html

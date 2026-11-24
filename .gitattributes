@@ -1,0 +1,3 @@
+# Preservar os bytes originais do lote e do documento arquivado, inclusive CRLF.
+experimentos/resultados/** -text
+docs/documento-projeto-v3.md -text
