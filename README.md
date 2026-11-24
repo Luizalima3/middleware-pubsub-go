@@ -152,7 +152,6 @@ O [lote final de 23/11/2026](experimentos/resultados/README.md) contém **15 exe
 
 ![Comparação dos cinco cenários: CPU, RAM, filas, latência, vazão e ausências](experimentos/resultados/comparativo.png)
 
-- [Resumo para explicar ao grupo](experimentos/resultados/RESUMO-PARA-O-GRUPO.md).
 - [Análise, tabela e limites das conclusões](experimentos/resultados/ANALISE.md).
 - [CSV comparativo](experimentos/resultados/comparativo.csv) e [detalhes por broker](experimentos/resultados/comparativo.json).
 - [Configuração](experimentos/resultados/configuracao.json), [ambiente e ordem das execuções](experimentos/resultados/manifesto.json) e [verificação dos dados](experimentos/resultados/verificacao-artefatos.json).
