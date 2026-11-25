@@ -182,8 +182,8 @@ go build ./...
 A versão usada na coleta passou em **47 testes**, análise do código e compilação Windows; a compilação Linux também foi conferida, sem execução da coleta nesse sistema. O teste de duplicação controlada verificou três entregas únicas e seis duplicatas filtradas para três publicações enviadas em triplicata. Consulte o [registro da validação](experimentos/resultados/VERIFICACAO.md).
 
 - Publicações UDP não têm garantia de entrega, ordem global ou execução exatamente uma vez.
-- Os caches são finitos: no broker, respostas administrativas usam 2.048 entradas e publicações recentes 8.192, com validade nominal de 20 segundos. Esses tamanhos estão fixados no código; uma entrada pode sair antes do prazo por falta de espaço.
-- Tentativas e prazos são configuráveis nas estruturas Go; nem todos possuem flags no executável. As opções expostas aparecem em `go run ./cmd/broker -h`.
+- Os caches são finitos: por padrão, no broker, respostas administrativas usam 2.048 entradas (`-cache-respostas`), publicações recentes 8.192 (`-cache-vistos`) e avisos do par 2.048 (`-cache-avisos`), com validade nominal de 20 segundos (`-validade-cache`); uma entrada pode sair antes do prazo se a capacidade for atingida.
+- Tentativas, prazos, filas e caches são configuráveis em `broker.Config` e nas flags do executável (`go run ./cmd/broker -h`). Consulte [BROKER.md](BROKER.md) para detalhes da arquitetura interna do broker.
 - Não há histórico, autenticação, confidencialidade, consenso nem uso validado em Internet aberta. O identificador do cliente é declarado e pressupõe um ambiente acadêmico confiável.
 - O detector `-race` não foi executado no ambiente da coleta, que não tem CGO e compilador C configurados.
 - O custo da instrumentação não foi isolado, e o impacto do consumidor lento nos normais ainda precisa de comparação controlada se a equipe quiser demonstrar isolamento de latência.
@@ -194,7 +194,7 @@ A versão usada na coleta passou em **47 testes**, análise do código e compila
 | --- | --- |
 | `client/` | Biblioteca pública e testes do cliente. |
 | `protocol/` | Mensagens JSON e validação. |
-| `internal/broker/` | Broker, tópicos, sessões, distribuição e repasse. |
+| `internal/broker/` | Broker, tópicos, sessões, distribuição e repasse ([BROKER.md](BROKER.md)). |
 | `internal/controle/`, `internal/fila/`, `internal/recente/` | Limitador, ajuste de taxa, filas e caches recentes. |
 | `internal/metricas/`, `internal/avaliacao/` | Coleta de recursos, carga e métricas. |
 | `cmd/` | Executáveis do broker e das demonstrações. |
