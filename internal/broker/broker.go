@@ -23,7 +23,8 @@ type Config struct {
 	TaxaCliente, TaxaEntrada, TaxaSaida, TaxaControle, TaxaPar float64
 	Rajada, FilaTopico, FilaCliente, BytesTopico, BytesCliente int
 	MaxClientes, MaxTopicos, MaxPendencias                     int
-	Intervalo, Inatividade, Repeticao                          time.Duration
+	CacheRespostas, CacheVistos, CacheAvisos                   int
+	Intervalo, Inatividade, Repeticao, ValidadeCache           time.Duration
 	Tentativas                                                 int
 }
 
@@ -41,8 +42,8 @@ func (c Config) padroes() (Config, error) {
 			return c, errors.New("taxas devem ser finitas e positivas")
 		}
 	}
-	ints := []*int{&c.Rajada, &c.FilaTopico, &c.FilaCliente, &c.BytesTopico, &c.BytesCliente, &c.MaxClientes, &c.MaxTopicos, &c.MaxPendencias, &c.Tentativas}
-	vals := []int{4, 128, 64, 128000, 64000, 256, 128, 512, 3}
+	ints := []*int{&c.Rajada, &c.FilaTopico, &c.FilaCliente, &c.BytesTopico, &c.BytesCliente, &c.MaxClientes, &c.MaxTopicos, &c.MaxPendencias, &c.Tentativas, &c.CacheRespostas, &c.CacheVistos, &c.CacheAvisos}
+	vals := []int{4, 128, 64, 128000, 64000, 256, 128, 512, 3, 2048, 8192, 2048}
 	for i, p := range ints {
 		if *p == 0 {
 			*p = vals[i]
@@ -60,7 +61,10 @@ func (c Config) padroes() (Config, error) {
 	if c.Repeticao == 0 {
 		c.Repeticao = 300 * time.Millisecond
 	}
-	if c.Intervalo < 10*time.Millisecond || c.Inatividade < c.Intervalo*3 || c.Repeticao < time.Millisecond {
+	if c.ValidadeCache == 0 {
+		c.ValidadeCache = 20 * time.Second
+	}
+	if c.Intervalo < 10*time.Millisecond || c.Inatividade < c.Intervalo*3 || c.Repeticao < time.Millisecond || c.ValidadeCache < time.Second {
 		return c, errors.New("intervalos inválidos")
 	}
 	if len(c.ID) > protocol.MaxCliente {
@@ -193,7 +197,7 @@ func Iniciar(cfg Config) (*Broker, error) {
 		return nil, errors.New("ID muito longo")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	b := &Broker{cfg: c, conn: conn, par: peer, ctx: ctx, cancel: cancel, topicos: map[string]*topico{}, clientes: map[string]*sessao{}, cotas: map[string]*cota{}, interesses: map[string]time.Time{}, pendentes: map[string]*pendencia{}, controles: make(chan saida, c.MaxPendencias), filaPar: fila.Nova[entrega](c.FilaTopico, c.BytesTopico), cache: recente.Nova[resposta](2048, 20*time.Second), vistos: recente.Nova[bool](8192, 20*time.Second), avisos: recente.Nova[bool](2048, 20*time.Second)}
+	b := &Broker{cfg: c, conn: conn, par: peer, ctx: ctx, cancel: cancel, topicos: map[string]*topico{}, clientes: map[string]*sessao{}, cotas: map[string]*cota{}, interesses: map[string]time.Time{}, pendentes: map[string]*pendencia{}, controles: make(chan saida, c.MaxPendencias), filaPar: fila.Nova[entrega](c.FilaTopico, c.BytesTopico), cache: recente.Nova[resposta](c.CacheRespostas, c.ValidadeCache), vistos: recente.Nova[bool](c.CacheVistos, c.ValidadeCache), avisos: recente.Nova[bool](c.CacheAvisos, c.ValidadeCache)}
 	b.entrada, _ = controle.Novo(c.TaxaEntrada, c.Rajada)
 	b.saida, _ = controle.Novo(c.TaxaSaida, c.Rajada)
 	b.controleEntrada, _ = controle.Novo(c.TaxaControle, c.Rajada)
@@ -444,6 +448,7 @@ func (b *Broker) administrar(s *sessao, m protocol.Mensagem) {
 		switch m.Tipo {
 		case protocol.TipoCriarTopico, protocol.TipoAssinar:
 			b.mu.Lock()
+			existia := b.topicos[m.Topico] != nil
 			t := b.novoTopico(m.Topico)
 			if t != nil && m.Tipo == protocol.TipoAssinar {
 				t.inscritos[s.addr.String()] = s
@@ -453,7 +458,9 @@ func (b *Broker) administrar(s *sessao, m protocol.Mensagem) {
 				r.Tipo = protocol.TipoErro
 				r.Conteudo = []byte("LIMITE_TOPICOS")
 			} else {
-				b.comunicarTopico(protocol.TipoCriarRemoto, m.Topico)
+				if m.Tipo == protocol.TipoCriarTopico || !existia {
+					b.comunicarTopico(protocol.TipoCriarRemoto, m.Topico)
+				}
 				b.anunciar(m.Topico)
 			}
 		case protocol.TipoCancelar:
