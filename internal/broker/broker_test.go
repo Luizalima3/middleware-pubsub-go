@@ -428,3 +428,42 @@ func TestTaxaMantidaSemPressaoEReduzidaComExcesso(t *testing.T) {
 		t.Fatal("não houve excesso para acionar redução")
 	}
 }
+
+func TestAssinarCriaTopicoESincronizaComPar(t *testing.T) {
+	b1, b2 := par(t)
+	s := conectar(t, []string{b1.Endereco()}, 8)
+	ctx, end := prazo(t)
+	defer end()
+	if _, e := s.Assinar(ctx, "criado-no-assinar"); e != nil {
+		t.Fatal(e)
+	}
+	esperar(t, func() bool {
+		return b1.Estatisticas().Topicos == 1 && b2.Estatisticas().Topicos == 1 && b2.Estatisticas().InteressesRemotos == 1
+	})
+}
+
+func TestTopicoSobrecarregadoEBytesELimitesConfiguraveis(t *testing.T) {
+	b := iniciar(t, broker.Config{
+		FilaTopico:     2,
+		BytesTopico:    120,
+		FilaCliente:    2,
+		BytesCliente:   120,
+		CacheRespostas: 32,
+		CacheVistos:    64,
+		CacheAvisos:    32,
+		ValidadeCache:  2 * time.Second,
+	})
+	sub := socket(t)
+	pub := socket(t)
+	enviar(t, sub, b.Endereco(), protocol.Mensagem{Tipo: protocol.TipoAssinar, ID: 1, Cliente: "sub", Topico: "curto"})
+	ler(t, sub, protocol.TipoOK)
+
+	// Mensagem cujo JSON codificado excede BytesTopico (120 bytes) é recusada
+	// na fila do tópico com TOPICO_SOBRECARREGADO.
+	grande := strings.Repeat("A", 110)
+	enviar(t, pub, b.Endereco(), protocol.Mensagem{Tipo: protocol.TipoPublicar, ID: 10, Cliente: "pub", Topico: "curto", Conteudo: []byte(grande)})
+	aviso := ler(t, pub, protocol.TipoErro)
+	if aviso.ID != 10 || string(aviso.Conteudo) != "TOPICO_SOBRECARREGADO" {
+		t.Fatalf("esperava TOPICO_SOBRECARREGADO id=10, obteve %+v (%q)", aviso, string(aviso.Conteudo))
+	}
+}
